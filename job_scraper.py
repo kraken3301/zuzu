@@ -326,15 +326,15 @@ CONFIG = {
     },
     
     # =========================================================================
-    # PATHS (Auto-configured for Colab)
+    # PATHS (Auto-configured for Colab and local)
     # =========================================================================
     'paths': {
-        'base_dir': '/content/drive/MyDrive/JobScraper',
-        'database_dir': '/content/drive/MyDrive/JobScraper/data',
-        'logs_dir': '/content/drive/MyDrive/JobScraper/logs',
-        'exports_dir': '/content/drive/MyDrive/JobScraper/exports',
-        'cookies_dir': '/content/drive/MyDrive/JobScraper/cookies',
-        'backups_dir': '/content/drive/MyDrive/JobScraper/backups',
+        'base_dir': '/content/drive/MyDrive/JobScraper' if IN_COLAB else './data',
+        'database_dir': '/content/drive/MyDrive/JobScraper/data' if IN_COLAB else './data',
+        'logs_dir': '/content/drive/MyDrive/JobScraper/logs' if IN_COLAB else './data/logs',
+        'exports_dir': '/content/drive/MyDrive/JobScraper/exports' if IN_COLAB else './data/exports',
+        'cookies_dir': '/content/drive/MyDrive/JobScraper/cookies' if IN_COLAB else './data/cookies',
+        'backups_dir': '/content/drive/MyDrive/JobScraper/backups' if IN_COLAB else './data/backups',
     },
     
     # =========================================================================
@@ -2342,17 +2342,16 @@ class JobScraperOrchestrator:
         self.logger.info("=" * 60)
         self.logger.info("INITIALIZING JOB SCRAPER BOT")
         self.logger.info("=" * 60)
-        
-        # Validate config
+
+        # Validate config (warn but don't fail if Telegram not configured)
         is_valid, errors = validate_config()
         if not is_valid:
             for error in errors:
-                self.logger.error(f"Config error: {error}")
-            return False
-        
-        # Setup environment
-        setup_environment()
-        
+                self.logger.warning(f"Config warning: {error}")
+            self.logger.info("Initializing with warnings (some features may not work)")
+
+        # Note: Environment is already setup in global initialize() function
+
         # Initialize proxies
         if CONFIG['proxy']['enabled']:
             proxy_count = self.proxy_manager.initialize()
@@ -2517,6 +2516,8 @@ orchestrator = None
 def initialize():
     """Initialize the scraper"""
     global orchestrator
+    # Setup environment (create directories) before initializing anything else
+    setup_environment()
     LogManager().setup()
     orchestrator = JobScraperOrchestrator()
     return orchestrator.initialize()

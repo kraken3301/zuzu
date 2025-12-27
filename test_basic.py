@@ -64,17 +64,20 @@ def test_config():
 def test_database():
     """Test database initialization"""
     print("\n🗃️ Testing database...")
-    
+
     try:
-        from job_scraper import DatabaseManager
-        
+        from job_scraper import DatabaseManager, setup_environment
+
+        # Setup environment first to create directories
+        setup_environment()
+
         db = DatabaseManager()
         stats = db.get_stats()
-        
+
         print("✅ Database initialized successfully")
         print(f"   Total jobs: {stats['total_jobs']}")
         print(f"   Unposted jobs: {stats['unposted']}")
-        
+
         return True
     except Exception as e:
         print(f"❌ Database test failed: {e}")
@@ -129,16 +132,19 @@ def test_job_class():
 def test_logging():
     """Test logging setup"""
     print("\n📝 Testing logging...")
-    
+
     try:
-        from job_scraper import LogManager
-        
+        from job_scraper import LogManager, setup_environment
+
+        # Setup environment first to create directories
+        setup_environment()
+
         log_manager = LogManager()
         log_manager.setup()
-        
+
         logger = LogManager.get_logger("TestLogger")
         logger.info("This is a test log message")
-        
+
         print("✅ Logging setup successful")
         return True
     except Exception as e:
