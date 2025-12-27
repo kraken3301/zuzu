@@ -28,12 +28,15 @@ import hashlib
 import logging
 import sqlite3
 import threading
+import ssl
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple, Set
 from urllib.parse import urlencode, quote_plus
 from concurrent.futures import ThreadPoolExecutor
+from urllib.error import URLError, HTTPError
 import requests
 from bs4 import BeautifulSoup
 
@@ -972,10 +975,11 @@ class DatabaseManager:
 # ============================================================================
 # Description: Proxy fetching, testing, and rotation
 # Uses free proxies by default, supports paid proxies
+# Includes SSL handling, exponential backoff, and circuit breaker
 # ============================================================================
 
 class ProxyManager:
-    """Advanced proxy management with rotation and health tracking"""
+    """Advanced proxy management with rotation, SSL handling, and health tracking"""
     
     FREE_PROXY_SOURCES = [
         'https://free-proxy-list.net/',
@@ -983,14 +987,24 @@ class ProxyManager:
         'https://www.us-proxy.org/',
     ]
     
+    # Test URLs for different protocols
+    TEST_URLS = {
+        'http': 'http://httpbin.org/ip',
+        'https': 'https://httpbin.org/ip',
+    }
+    
     def __init__(self):
         self.logger = LogManager.get_logger('ProxyManager')
         self._proxies: List[str] = []
         self._working_proxies: Set[str] = set()
         self._blacklist: Set[str] = set()
+        self._temp_blacklist: Dict[str, float] = {}  # proxy -> unblock time
         self._failures: Dict[str, int] = {}
+        self._ssl_failures: Set[str] = set()  # proxies that fail SSL
         self._lock = threading.Lock()
         self._current_index = 0
+        self._last_test_time: Optional[datetime] = None
+        self._test_interval_hours = 6  # Re-test proxies every 6 hours
     
     def initialize(self) -> int:
         """Initialize proxy pool"""
@@ -1039,29 +1053,74 @@ class ProxyManager:
                     if len(cols) >= 2:
                         ip = cols[0].text.strip()
                         port = cols[1].text.strip()
+                        # Prefer HTTPS proxies if configured
+                        https_col = cols[6] if len(cols) > 6 else None
+                        is_https = https_col and https_col.text.strip().lower() == 'yes'
+                        protocol = 'https' if (CONFIG['proxy']['prefer_https'] and is_https) else 'http'
                         if ip and port:
-                            proxies.append(f"http://{ip}:{port}")
+                            proxies.append(f"{protocol}://{ip}:{port}")
         except Exception as e:
             self.logger.debug(f"Error fetching proxies: {e}")
         
         return proxies[:CONFIG['proxy']['free_proxy_count']]
     
-    def _test_all_proxies(self):
-        """Test all proxies in parallel"""
-        self.logger.info(f"Testing {len(self._proxies)} proxies...")
+    def _test_proxy_https(self, proxy: str) -> Tuple[bool, bool]:
+        """
+        Test proxy with HTTPS/SSL handling.
+        Returns (success, is_ssl_error).
+        """
+        try:
+            # Create a session that doesn't verify SSL (for testing)
+            session = requests.Session()
+            session.verify = False  # Disable SSL verification for testing
+            
+            # Test with HTTPS
+            response = session.get(
+                self.TEST_URLS['https'],
+                proxies={'http': proxy, 'https': proxy},
+                timeout=CONFIG['proxy']['test_timeout']
+            )
+            
+            if response.status_code == 200:
+                # Try with SSL verification too
+                try:
+                    requests.get(
+                        self.TEST_URLS['https'],
+                        proxies={'http': proxy, 'https': proxy},
+                        timeout=CONFIG['proxy']['test_timeout']
+                    )
+                    return True, False  # Works with SSL verification
+                except Exception:
+                    return True, True  # Works but SSL issues
+                    
+        except requests.exceptions.SSLError as e:
+            self.logger.debug(f"SSL error for proxy {proxy}: {e}")
+            return False, True
+        except requests.exceptions.Timeout:
+            return False, False
+        except Exception as e:
+            self.logger.debug(f"Proxy test error for {proxy}: {e}")
+            return False, False
         
-        test_url = CONFIG['proxy']['test_url']
-        timeout = CONFIG['proxy']['test_timeout']
+        return False, False
+    
+    def _test_all_proxies(self):
+        """Test all proxies with HTTPS/SSL handling"""
+        self.logger.info(f"Testing {len(self._proxies)} proxies...")
         
         def test_one(proxy: str) -> Optional[str]:
             try:
-                response = requests.get(
-                    test_url,
-                    proxies={'http': proxy, 'https': proxy},
-                    timeout=timeout
-                )
-                if response.status_code == 200:
-                    return proxy
+                success, is_ssl_error = self._test_proxy_https(proxy)
+                
+                if success:
+                    # Test HTTP as well for completeness
+                    response = requests.get(
+                        self.TEST_URLS['http'],
+                        proxies={'http': proxy, 'https': proxy},
+                        timeout=CONFIG['proxy']['test_timeout']
+                    )
+                    if response.status_code == 200:
+                        return proxy
             except:
                 pass
             return None
@@ -1070,15 +1129,40 @@ class ProxyManager:
             results = list(executor.map(test_one, self._proxies))
         
         self._working_proxies = set(p for p in results if p)
+        self._last_test_time = datetime.now()
         self.logger.info(f"Found {len(self._working_proxies)} working proxies")
     
+    def _cleanup_temp_blacklist(self):
+        """Remove expired entries from temporary blacklist"""
+        now = time.time()
+        expired = [p for p, unblock_at in self._temp_blacklist.items() if now >= unblock_at]
+        for p in expired:
+            self._temp_blacklist.pop(p, None)
+            self.logger.info(f"Proxy restored from temp blacklist: {p}")
+    
+    def _get_backoff_delay(self, proxy: str, attempt: int) -> float:
+        """Calculate exponential backoff delay"""
+        base_delay = 1.0  # 1 second base
+        max_delay = 60.0  # 60 seconds max
+        
+        # Increase delay based on failure count
+        failures = self._failures.get(proxy, 0)
+        delay = min(base_delay * (2 ** min(failures, 5)), max_delay)
+        
+        # Add jitter
+        return delay + random.uniform(0, 0.5)
+    
     def get_proxy(self, domain: str = None) -> Optional[str]:
-        """Get next working proxy"""
+        """Get next working proxy with retry support"""
         if not CONFIG['proxy']['enabled']:
             return None
         
+        # Cleanup expired temp blacklist entries
+        self._cleanup_temp_blacklist()
+        
         with self._lock:
-            available = self._working_proxies - self._blacklist
+            available = self._working_proxies - self._blacklist - set(self._temp_blacklist.keys())
+            
             if not available:
                 self.logger.warning("No working proxies available!")
                 return None
@@ -1091,28 +1175,66 @@ class ProxyManager:
         with self._lock:
             self._failures[proxy] = 0
             self._working_proxies.add(proxy)
+            # Remove from temp blacklist if present
+            self._temp_blacklist.pop(proxy, None)
+            self._ssl_failures.discard(proxy)
     
     def report_failure(self, proxy: str, domain: str = None, error: str = None):
-        """Report proxy failure"""
+        """
+        Report proxy failure with error type detection.
+        
+        Args:
+            proxy: The proxy that failed
+            domain: Optional domain context
+            error: Error message for diagnostics
+        """
         with self._lock:
-            self._failures[proxy] = self._failures.get(proxy, 0) + 1
+            # Detect error type
+            is_ssl_error = False
+            is_timeout = False
+            
+            if error:
+                error_lower = error.lower()
+                is_ssl_error = 'ssl' in error_lower or 'certificate' in error_lower
+                is_timeout = 'timeout' in error_lower or 'timed out' in error_lower
+            
+            # Handle SSL failures separately
+            if is_ssl_error:
+                self._ssl_failures.add(proxy)
+                # Don't immediately blacklist - might work for HTTP
+                if CONFIG['proxy']['prefer_https']:
+                    self._failures[proxy] = self._failures.get(proxy, 0) + 1
+            else:
+                self._failures[proxy] = self._failures.get(proxy, 0) + 1
             
             max_failures = CONFIG['proxy']['max_failures_before_blacklist']
+            
             if self._failures[proxy] >= max_failures:
-                self._blacklist.add(proxy)
-                self._working_proxies.discard(proxy)
-                self.logger.debug(f"Blacklisted proxy: {proxy}")
+                if is_ssl_error and not CONFIG['proxy']['prefer_https']:
+                    # Temporary blacklist for SSL issues (might recover)
+                    self._temp_blacklist[proxy] = time.time() + 300  # 5 minutes
+                    self._working_proxies.discard(proxy)
+                    self.logger.debug(f"Temp blacklisted proxy (SSL): {proxy}")
+                else:
+                    # Permanent blacklist
+                    self._blacklist.add(proxy)
+                    self._working_proxies.discard(proxy)
+                    self.logger.debug(f"Blacklisted proxy: {proxy}")
     
     def get_working_count(self) -> int:
         """Get count of working proxies"""
-        return len(self._working_proxies - self._blacklist)
+        self._cleanup_temp_blacklist()
+        return len(self._working_proxies - self._blacklist - set(self._temp_blacklist.keys()))
     
     def get_stats(self) -> dict:
-        """Get proxy statistics"""
+        """Get proxy statistics with SSL failure tracking"""
+        self._cleanup_temp_blacklist()
         return {
             'total': len(self._proxies),
             'working': len(self._working_proxies),
             'blacklisted': len(self._blacklist),
+            'temp_blacklisted': len(self._temp_blacklist),
+            'ssl_failures': len(self._ssl_failures),
             'available': self.get_working_count(),
         }
 
@@ -1179,25 +1301,40 @@ class FingerprintGenerator:
 # ============================================================================
 # CELL 9: HTTP CLIENT
 # ============================================================================
-# Description: HTTP client with retry logic and proxy support
-# Handles all HTTP requests with automatic retries
+# Description: HTTP client with retry logic, proxy support, and SSL handling
+# Handles all HTTP requests with automatic retries and exponential backoff
 # ============================================================================
 
 class HTTPClient:
-    """HTTP client with retry, proxy rotation, and fingerprint spoofing"""
+    """HTTP client with retry, proxy rotation, SSL handling, and fingerprint spoofing"""
     
     def __init__(self, proxy_manager: ProxyManager):
         self.proxy_manager = proxy_manager
         self.logger = LogManager.get_logger('HTTPClient')
         self.session = requests.Session()
+        # Configure session to handle SSL issues gracefully
+        self.session.verify = True  # Can be set to False for problematic proxies
+    
+    def _detect_ssl_error(self, error: Exception) -> bool:
+        """Detect if error is SSL-related"""
+        error_str = str(error).lower()
+        ssl_keywords = ['ssl', 'certificate', 'verify', 'certificate_verify_failed']
+        return any(keyword in error_str for keyword in ssl_keywords)
     
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
         reraise=True
     )
-    def get(self, url: str, **kwargs) -> requests.Response:
-        """Make GET request with retry"""
+    def get(self, url: str, allow_ssl_bypass: bool = False, **kwargs) -> requests.Response:
+        """
+        Make GET request with retry and SSL handling.
+        
+        Args:
+            url: The URL to fetch
+            allow_ssl_bypass: If True, retry with SSL verification disabled on failure
+            **kwargs: Additional requests parameters
+        """
         # Add fingerprint headers
         headers = FingerprintGenerator.get_random()
         headers.update(kwargs.pop('headers', {}))
@@ -1206,11 +1343,16 @@ class HTTPClient:
         proxy = self.proxy_manager.get_proxy()
         proxies = {'http': proxy, 'https': proxy} if proxy else None
         
-        # Add delay
-        time.sleep(random.uniform(
-            CONFIG['scraping']['delay_min'],
-            CONFIG['scraping']['delay_max']
-        ))
+        # Add delay based on proxy failure count for backoff
+        if proxy:
+            delay = self.proxy_manager._get_backoff_delay(proxy, 
+                self.proxy_manager._failures.get(proxy, 0))
+            time.sleep(delay)
+        else:
+            time.sleep(random.uniform(
+                CONFIG['scraping']['delay_min'],
+                CONFIG['scraping']['delay_max']
+            ))
         
         try:
             response = self.session.get(
@@ -1230,6 +1372,13 @@ class HTTPClient:
         except requests.RequestException as e:
             if proxy:
                 self.proxy_manager.report_failure(proxy, error=str(e))
+            
+            # If SSL error and allowed, retry with SSL verification disabled
+            if self._detect_ssl_error(e) and allow_ssl_bypass:
+                self.logger.debug(f"SSL error, retrying without verification: {url}")
+                kwargs['verify'] = False
+                return self.get(url, allow_ssl_bypass=False, **kwargs)
+            
             self.logger.warning(f"Request failed: {url} - {e}")
             raise
     
@@ -1440,12 +1589,57 @@ class BaseScraper(ABC):
 # ============================================================================
 # Description: LinkedIn job scraper
 # Uses public guest API (safer) or logged-in scraping (higher risk)
+# Includes fallback selectors, diagnostic logging, and anti-detection measures
 # ============================================================================
 
 class LinkedInScraper(BaseScraper):
-    """LinkedIn job scraper"""
+    """LinkedIn job scraper with fallback selectors and diagnostic logging"""
     
     BASE_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    
+    # CSS selector fallbacks for job cards (LinkedIn changes these frequently)
+    CARD_SELECTORS = [
+        ('div', 'base-card'),
+        ('li', 'jobs-search-results__list-item'),
+        ('div', 'job-search-card'),
+        ('article', 'job-card'),
+        ('div', 'result-card'),
+        ('div', 'job-card-container'),
+    ]
+    
+    # Title selector fallbacks
+    TITLE_SELECTORS = [
+        ('h3', 'base-search-card__title'),
+        ('h3', 'job-search-card__title'),
+        ('span', 'job-search-card__title'),
+        ('a', 'job-search-card__title'),
+        ('h2', None),  # Any h2
+    ]
+    
+    # Company selector fallbacks
+    COMPANY_SELECTORS = [
+        ('h4', 'base-search-card__subtitle'),
+        ('h4', 'job-search-card__subtitle'),
+        ('span', 'job-search-card__company-name'),
+        ('a', 'job-search-card__company-name'),
+        ('div', None),  # Fallback to any div
+    ]
+    
+    # Location selector fallbacks
+    LOCATION_SELECTORS = [
+        ('span', 'job-search-card__location'),
+        ('span', 'job-search-card__location-artful'),
+        ('div', 'job-search-card__location'),
+        ('li', None),  # Any li
+    ]
+    
+    # Link selector fallbacks
+    LINK_SELECTORS = [
+        ('a', 'base-card__full-link'),
+        ('a', 'job-search-card__link'),
+        ('a', 'result-card__full-card-link'),
+        ('a', None),  # Any anchor
+    ]
     
     def scrape_all(self) -> List[Job]:
         """Scrape all configured LinkedIn searches"""
@@ -1476,10 +1670,11 @@ class LinkedInScraper(BaseScraper):
         return all_jobs
     
     def _scrape_public_api(self, keyword: str, location: str) -> List[Job]:
-        """Scrape using public guest API"""
+        """Scrape using public guest API with diagnostic logging"""
         jobs = []
         start = 0
         max_results = CONFIG['linkedin']['max_results_per_search']
+        page_size = 25
         
         while start < max_results:
             params = {
@@ -1493,44 +1688,104 @@ class LinkedInScraper(BaseScraper):
             url = f"{self.BASE_URL}?{urlencode(params)}"
             
             try:
-                soup = self.http.get_soup(url)
-                cards = soup.find_all('div', class_='base-card')
+                response = self.http.get(url)
+                soup = BeautifulSoup(response.text, 'lxml')
+                
+                # Try each selector combination
+                cards = self._find_cards_with_fallbacks(soup)
                 
                 if not cards:
+                    # Log diagnostic info when no cards found
+                    self.logger.warning(
+                        f"No job cards found for '{keyword}' in '{location}'. "
+                        f"Response length: {len(response.text)} chars"
+                    )
+                    
+                    # Log HTML structure for debugging (first 500 chars)
+                    html_sample = str(soup)[:500]
+                    self.logger.debug(f"HTML sample: {html_sample}")
+                    
+                    # Try to find any list-like structure
+                    all_links = soup.find_all('a')
+                    self.logger.debug(f"Total links in response: {len(all_links)}")
+                    
                     break
                 
                 for card in cards:
                     try:
-                        job = self._parse_public_card(card, keyword)
+                        job = self._parse_card_with_fallbacks(card, keyword)
                         if job and self.validate_job(job) and self.apply_filters(job):
                             jobs.append(job)
                     except Exception as e:
                         self.logger.debug(f"Failed to parse card: {e}")
                 
-                start += 25
+                start += page_size
+                
+                # Add delay between pages to avoid detection
+                time.sleep(random.uniform(3, 6))
                 
             except Exception as e:
                 self.logger.warning(f"LinkedIn API request failed: {e}")
-                break
+                # Retry with backoff
+                time.sleep(5)
+                continue
         
         self.logger.info(f"Found {len(jobs)} LinkedIn jobs for '{keyword}'")
         return jobs
     
-    def _parse_public_card(self, card, keyword: str) -> Optional[Job]:
-        """Parse job card from public API response"""
-        try:
-            title_elem = card.find('h3', class_='base-search-card__title')
-            company_elem = card.find('h4', class_='base-search-card__subtitle')
-            location_elem = card.find('span', class_='job-search-card__location')
-            link_elem = card.find('a', class_='base-card__full-link')
+    def _find_cards_with_fallbacks(self, soup: BeautifulSoup) -> List:
+        """Find job cards using multiple CSS selector fallbacks"""
+        for tag, class_name in self.CARD_SELECTORS:
+            if class_name:
+                cards = soup.find_all(tag, class_=class_name)
+            else:
+                cards = soup.find_all(tag)
             
-            if not all([title_elem, company_elem, link_elem]):
+            if cards:
+                self.logger.debug(f"Found {len(cards)} cards using selector ({tag}, {class_name})")
+                return cards
+        
+        return []
+    
+    def _find_element_with_fallbacks(self, parent, selectors: List[Tuple[str, Optional[str]]]) -> Optional:
+        """Find an element using multiple selector fallbacks"""
+        for tag, class_name in selectors:
+            if class_name:
+                elem = parent.find(tag, class_=class_name)
+            else:
+                elem = parent.find(tag)
+            
+            if elem:
+                return elem
+        
+        return None
+    
+    def _parse_card_with_fallbacks(self, card, keyword: str) -> Optional[Job]:
+        """Parse job card using fallback selectors with detailed logging"""
+        try:
+            # Try fallback selectors for each element
+            title_elem = self._find_element_with_fallbacks(card, self.TITLE_SELECTORS)
+            company_elem = self._find_element_with_fallbacks(card, self.COMPANY_SELECTORS)
+            location_elem = self._find_element_with_fallbacks(card, self.LOCATION_SELECTORS)
+            link_elem = self._find_element_with_fallbacks(card, self.LINK_SELECTORS)
+            
+            if not all([title_elem, link_elem]):
+                # Log diagnostic info
+                self.logger.debug(
+                    f"Missing required elements - title: {bool(title_elem)}, "
+                    f"link: {bool(link_elem)}, company: {bool(company_elem)}, "
+                    f"location: {bool(location_elem)}"
+                )
                 return None
             
             title = title_elem.get_text(strip=True)
-            company = company_elem.get_text(strip=True)
+            company = company_elem.get_text(strip=True) if company_elem else "Unknown"
             location = location_elem.get_text(strip=True) if location_elem else ""
             url = link_elem.get('href', '').split('?')[0]
+            
+            if not title or not url:
+                self.logger.debug(f"Empty title or URL - title: '{title}', url: '{url}'")
+                return None
             
             # Get job ID from URL
             source_id = url.split('-')[-1] if url else None
@@ -2165,28 +2420,46 @@ class SupersetScraper(BaseScraper):
 # Handles rate limiting and error recovery
 # ============================================================================
 
+import asyncio
+
 class TelegramPoster:
     """Post jobs to Telegram channel"""
     
     def __init__(self):
         self.logger = LogManager.get_logger('TelegramPoster')
         self.bot = None
+        self._loop = None
         
         if CONFIG['telegram']['enabled']:
             self.bot = Bot(token=CONFIG['telegram']['bot_token'])
+            self._loop = asyncio.new_event_loop()
     
-    def test_connection(self) -> bool:
-        """Test Telegram bot connection"""
+    def _run_async(self, coro):
+        """Run async coroutine in event loop"""
+        if not self._loop:
+            return None
+        try:
+            return self._loop.run_until_complete(coro)
+        except Exception as e:
+            self.logger.error(f"Async error: {e}")
+            return None
+    
+    async def _test_connection_async(self) -> bool:
+        """Test Telegram bot connection (async version)"""
         if not self.bot:
             return False
         
         try:
-            bot_info = self.bot.get_me()
+            bot_info = await self.bot.get_me()
             self.logger.info(f"Connected to Telegram bot: @{bot_info.username}")
             return True
         except Exception as e:
             self.logger.error(f"Telegram connection failed: {e}")
             return False
+    
+    def test_connection(self) -> bool:
+        """Test Telegram bot connection"""
+        return self._run_async(self._test_connection_async())
     
     def post_job(self, job: Job) -> Optional[int]:
         """Post single job, returns message_id"""
