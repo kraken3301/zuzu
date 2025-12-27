@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env
+
+# Database files
+data/
+*.db
+*.sqlite
+
+# Logs
+logs/
+*.log
+
+# Exports
+exports/
+*.csv
+*.json
+
+# Cookies and sessions
+cookies/
+*.json
+
+# Backups
+backups/
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Python cache
+.pytest_cache/
+
+# Coverage
+.htmlcov/
+.coverage
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Google Colab
+/content/drive/
