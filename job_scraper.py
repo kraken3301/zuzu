@@ -36,31 +36,54 @@ from urllib.parse import urlencode, quote_plus
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from bs4 import BeautifulSoup
+from tenacity import retry, stop_after_attempt, wait_exponential
+import pandas as pd
+
+# Try to import optional dependencies with graceful fallbacks
+try:
+    import feedparser  # For Indeed RSS feed parsing
+except ImportError:  # pragma: no cover
+    feedparser = None
+    logging.warning("feedparser not installed. Indeed RSS scraping will be disabled.")
+
+try:
+    import telegram
+    from telegram import Bot
+    from telegram.constants import ParseMode
+    from telegram.error import TelegramError, RetryAfter
+except ImportError:  # pragma: no cover
+    telegram = None
+    Bot = None
+    ParseMode = None
+    TelegramError = Exception
+    RetryAfter = None
+    logging.warning("python-telegram-bot not installed. Telegram posting will be disabled.")
 
 try:
     from fake_useragent import UserAgent  # type: ignore
 except ImportError:  # pragma: no cover
     UserAgent = None  # type: ignore
+    logging.warning("fake-useragent not installed. Using fallback user agents.")
 
-import feedparser
-import pandas as pd
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-# Selenium imports
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import *
-from webdriver_manager.chrome import ChromeDriverManager
-
-# Telegram imports
-import telegram
-from telegram import Bot
-from telegram.constants import ParseMode
-from telegram.error import TelegramError, RetryAfter
+# Selenium imports (with graceful fallback)
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import *
+    from webdriver_manager.chrome import ChromeDriverManager
+except ImportError:  # pragma: no cover
+    webdriver = None
+    Options = None
+    Service = None
+    By = None
+    WebDriverWait = None
+    EC = None
+    ChromeDriverManager = None
+    logging.warning("Selenium not installed. Browser automation will be disabled.")
 
 # Google Colab specific
 try:
@@ -1257,14 +1280,19 @@ class BrowserManager:
     def __init__(self, proxy_manager: ProxyManager):
         self.proxy_manager = proxy_manager
         self.logger = LogManager.get_logger('BrowserManager')
-        self._drivers: List[webdriver.Chrome] = []
+        self._drivers: List = []
     
     def get_selenium_driver(
         self, 
         proxy: str = None, 
         headless: bool = True
-    ) -> webdriver.Chrome:
+    ):
         """Get Selenium Chrome driver with stealth settings"""
+        
+        # Check if Selenium is available
+        if webdriver is None or Options is None:
+            self.logger.warning("Selenium not installed. Returning None driver.")
+            return None
         
         options = Options()
         
@@ -1278,7 +1306,14 @@ class BrowserManager:
         options.add_argument('--disable-extensions')
         options.add_argument('--disable-gpu')
         options.add_argument('--window-size=1920,1080')
-        options.add_argument(f'--user-agent={UserAgent().random}')
+        # Use random user agent with fallback
+        if UserAgent is not None:
+            try:
+                options.add_argument(f'--user-agent={UserAgent().random}')
+            except Exception:
+                options.add_argument(f'--user-agent={get_random_user_agent()}')
+        else:
+            options.add_argument(f'--user-agent={get_random_user_agent()}')
         
         # Disable automation flags
         options.add_experimental_option('excludeSwitches', ['enable-automation'])
@@ -1290,31 +1325,42 @@ class BrowserManager:
         
         # Create driver
         try:
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
-        except:
-            # Fallback for Colab
-            driver = webdriver.Chrome(options=options)
+            if ChromeDriverManager is not None:
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=options)
+            else:
+                # Fallback without webdriver-manager
+                driver = webdriver.Chrome(options=options)
+        except Exception as e:
+            self.logger.warning(f"Failed to create Chrome driver: {e}")
+            # Try direct Chrome creation as last resort
+            try:
+                driver = webdriver.Chrome(options=options)
+            except Exception:
+                self.logger.error("All Chrome driver initialization attempts failed")
+                return None
         
         # Apply stealth patches
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': '''
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-            '''
-        })
+        if driver:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                '''
+            })
+            
+            driver.set_page_load_timeout(CONFIG['scraping']['page_load_timeout'])
+            
+            self._drivers.append(driver)
+            self.logger.debug("Created new Selenium driver")
         
-        driver.set_page_load_timeout(CONFIG['scraping']['page_load_timeout'])
-        
-        self._drivers.append(driver)
-        self.logger.debug("Created new Selenium driver")
         return driver
     
     def human_scroll(self, driver, times: int = 5, pause: float = None):
@@ -1336,17 +1382,27 @@ class BrowserManager:
         self, 
         driver, 
         selector: str, 
-        by: By = By.CSS_SELECTOR, 
+        by = None, 
         timeout: int = 10
     ):
         """Wait for element to be present"""
+        # Handle case when Selenium is not available or by is None
+        if WebDriverWait is None or EC is None or By is None:
+            self.logger.warning("Selenium components not available for wait_for_element")
+            return None
+        
+        if by is None:
+            by = By.CSS_SELECTOR
+        
         wait = WebDriverWait(driver, timeout)
         return wait.until(EC.presence_of_element_located((by, selector)))
     
-    def safe_click(self, driver, selector: str, by: By = By.CSS_SELECTOR):
+    def safe_click(self, driver, selector: str, by = None):
         """Safely click an element"""
         try:
             element = self.wait_for_element(driver, selector, by)
+            if element is None:
+                return False
             driver.execute_script("arguments[0].click();", element)
             return True
         except Exception as e:
@@ -1581,9 +1637,12 @@ class IndeedScraper(BaseScraper):
                 try:
                     self.logger.info(f"Scraping Indeed: '{keyword}' in '{location}'")
                     
-                    if CONFIG['indeed']['use_rss']:
+                    # Use RSS if available and configured, otherwise use web scraping
+                    if CONFIG['indeed']['use_rss'] and feedparser is not None:
                         jobs = self._scrape_via_rss(keyword, location)
                     else:
+                        if feedparser is None:
+                            self.logger.info("feedparser not installed, using web scraping fallback")
                         jobs = self._scrape_via_web(keyword, location)
                     
                     all_jobs.extend(jobs)
@@ -1871,6 +1930,11 @@ class NaukriScraper(BaseScraper):
         try:
             driver = self.browser.get_selenium_driver()
             
+            # Handle case when driver is None (Selenium not available)
+            if driver is None:
+                self.logger.warning("Selenium driver not available, skipping browser-based scraping")
+                return jobs
+            
             search_url = f"https://www.naukri.com/{keyword.replace(' ', '-')}-jobs-in-{location}"
             driver.get(search_url)
             
@@ -1957,6 +2021,11 @@ class SupersetScraper(BaseScraper):
         
         try:
             driver = self.browser.get_selenium_driver(headless=True)
+            
+            # Handle case when driver is None (Selenium not available)
+            if driver is None:
+                self.logger.warning("Selenium driver not available. Superset requires browser automation.")
+                return []
             
             # Attempt to load saved cookies
             if CONFIG['superset']['use_saved_cookies']:
@@ -2173,7 +2242,13 @@ class TelegramPoster:
         self.bot = None
         
         if CONFIG['telegram']['enabled']:
-            self.bot = Bot(token=CONFIG['telegram']['bot_token'])
+            if Bot is not None:
+                try:
+                    self.bot = Bot(token=CONFIG['telegram']['bot_token'])
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize Telegram bot: {e}")
+            else:
+                self.logger.warning("Telegram module not available. Set CONFIG['telegram']['enabled'] = False to suppress this warning.")
     
     def test_connection(self) -> bool:
         """Test Telegram bot connection"""
@@ -2200,16 +2275,17 @@ class TelegramPoster:
         try:
             message = job.to_telegram_message()
             
-            # Try Markdown first
+            # Try Markdown first (if ParseMode is available)
             try:
+                parse_mode = ParseMode.MARKDOWN if ParseMode else None
                 result = self.bot.send_message(
                     chat_id=CONFIG['telegram']['channel_id'],
                     text=message,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=parse_mode,
                     disable_web_page_preview=True
                 )
-            except:
-                # Fallback to plain text
+            except (TelegramError, TypeError):
+                # Fallback to plain text (when ParseMode is None or Markdown fails)
                 plain_message = self._strip_formatting(message)
                 result = self.bot.send_message(
                     chat_id=CONFIG['telegram']['channel_id'],
@@ -2220,10 +2296,14 @@ class TelegramPoster:
             self.logger.debug(f"Posted job: {job.title}")
             return result.message_id
             
-        except RetryAfter as e:
-            self.logger.warning(f"Rate limited, waiting {e.retry_after}s")
-            time.sleep(e.retry_after)
-            return self.post_job(job)
+        except (RetryAfter, type(RetryAfter) if RetryAfter else Exception) as e:
+            if RetryAfter and isinstance(e, RetryAfter):
+                self.logger.warning(f"Rate limited, waiting {e.retry_after}s")
+                time.sleep(e.retry_after)
+                return self.post_job(job)
+            else:
+                self.logger.error(f"Failed to post job: {e}")
+                return None
         except Exception as e:
             self.logger.error(f"Failed to post job: {e}")
             return None
@@ -2251,11 +2331,16 @@ class TelegramPoster:
         if not CONFIG['telegram']['enabled'] or not CONFIG['telegram']['send_summary']:
             return
         
+        if not self.bot:
+            self.logger.warning("Cannot send summary: Telegram bot not initialized")
+            return
+        
         try:
+            parse_mode = ParseMode.MARKDOWN if ParseMode else None
             self.bot.send_message(
                 chat_id=CONFIG['telegram']['channel_id'],
                 text=stats.get_summary(),
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=parse_mode
             )
             self.logger.info("Posted run summary to Telegram")
         except Exception as e:
@@ -2266,16 +2351,21 @@ class TelegramPoster:
         if not CONFIG['telegram']['error_notifications']:
             return
         
+        if not self.bot:
+            self.logger.warning(f"Cannot send error notification: Telegram bot not initialized")
+            return
+        
         chat_id = CONFIG['telegram'].get('admin_chat_id') or CONFIG['telegram']['channel_id']
         
         try:
+            parse_mode = ParseMode.MARKDOWN if ParseMode else None
             self.bot.send_message(
                 chat_id=chat_id,
                 text=f"⚠️ Scraper Error\n\n{message}",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=parse_mode
             )
-        except:
-            pass
+        except Exception as e:
+            self.logger.error(f"Failed to send error notification: {e}")
     
     def _is_quiet_hours(self) -> bool:
         """Check if currently in quiet hours"""
