@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover
 
 import feedparser
 import pandas as pd
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Selenium imports
 from selenium import webdriver
@@ -177,7 +177,9 @@ CONFIG = {
         'experience_levels': [1, 2],          # 1=Internship, 2=Entry
         'time_posted': 'r86400',              # Past 24 hours (r604800 = week)
         'max_results_per_search': 100,
-        'max_retries': 3,
+        'max_retries': 5,                     # Increased
+        'request_delay_min': 2,               # Added
+        'request_delay_max': 5,               # Added
     },
     
     # =========================================================================
@@ -272,10 +274,16 @@ CONFIG = {
     'proxy': {
         'enabled': True,
         'use_free_proxies': True,
-        'free_proxy_count': 50,               # Max free proxies to fetch
+        'free_proxy_count': 100,               # Max free proxies to fetch
         'test_before_use': True,
         'test_url': 'https://httpbin.org/ip',
-        'test_timeout': 10,
+        'test_timeout': 20,
+        'request_timeout': 15,        # Total timeout
+        'connect_timeout': 10,        # Connection establishment
+        'read_timeout': 10,           # Waiting for response
+        'adaptive_timeout': True,
+        'timeout_escalation': [15, 20, 30],
+        'allow_unverified_ssl': True,
         'custom_proxies': [
             # Add your paid proxies here
             # 'http://user:pass@ip:port',
@@ -285,6 +293,9 @@ CONFIG = {
         'max_failures_before_blacklist': 3,
         'prefer_https': True,
         'geo_filter': None,                   # e.g., 'IN' for Indian proxies
+        'recovery_time': 300,                 # seconds (5 minutes)
+        'max_recovery_attempts': 3,
+        'min_success_rate': 0.5,
     },
     
     # =========================================================================
@@ -985,6 +996,7 @@ class ProxyManager:
         'https://free-proxy-list.net/',
         'https://www.sslproxies.org/',
         'https://www.us-proxy.org/',
+        'https://www.vpngate.net/api/iphone/',
     ]
     
     # Test URLs for different protocols
@@ -1000,6 +1012,9 @@ class ProxyManager:
         self._blacklist: Set[str] = set()
         self._temp_blacklist: Dict[str, float] = {}  # proxy -> unblock time
         self._failures: Dict[str, int] = {}
+        self._successes: Dict[str, int] = {}
+        self._domain_blacklist: Dict[str, Set[str]] = {}  # domain -> set of proxies
+        self._recovery_attempts: Dict[str, int] = {}
         self._ssl_failures: Set[str] = set()  # proxies that fail SSL
         self._lock = threading.Lock()
         self._current_index = 0
@@ -1043,24 +1058,51 @@ class ProxyManager:
         proxies = []
         try:
             headers = {'User-Agent': get_random_user_agent()}
-            response = requests.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            response = requests.get(url, headers=headers, timeout=15)
             
-            table = soup.find('table')
-            if table:
-                for row in table.find_all('tr')[1:]:
-                    cols = row.find_all('td')
-                    if len(cols) >= 2:
-                        ip = cols[0].text.strip()
-                        port = cols[1].text.strip()
-                        # Prefer HTTPS proxies if configured
-                        https_col = cols[6] if len(cols) > 6 else None
-                        is_https = https_col and https_col.text.strip().lower() == 'yes'
-                        protocol = 'https' if (CONFIG['proxy']['prefer_https'] and is_https) else 'http'
-                        if ip and port:
-                            proxies.append(f"{protocol}://{ip}:{port}")
+            if 'vpngate.net' in url:
+                # Specialized parser for VPNGate format
+                # Format: IP:Port pairs or CSV with IP and other metadata
+                self.logger.debug(f"Using specialized parser for VPNGate: {url}")
+                
+                # Extract IP:Port combinations from response text
+                # VPNGate often returns CSV where IP is 2nd col and port is 3rd or part of config
+                # But sometimes it's just a text list. We use regex for robustness.
+                ip_port_matches = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)', response.text)
+                for ip, port in ip_port_matches:
+                    proxies.append(f"http://{ip}:{port}")
+                
+                # If no IP:Port found, try to find just IPs and use default ports
+                if not proxies:
+                    ip_matches = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', response.text)
+                    for ip in ip_matches:
+                        # Skip if it's the header or a common non-proxy IP
+                        if ip.endswith('.0') or ip.startswith('127.'):
+                            continue
+                        # Common proxy ports used by VPNGate and others
+                        for port in ['8080', '80', '443', '3128']:
+                            proxies.append(f"http://{ip}:{port}")
+                
+                self.logger.info(f"Extracted {len(proxies)} proxies from VPNGate")
+            else:
+                # Original HTML parser
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                table = soup.find('table')
+                if table:
+                    for row in table.find_all('tr')[1:]:
+                        cols = row.find_all('td')
+                        if len(cols) >= 2:
+                            ip = cols[0].text.strip()
+                            port = cols[1].text.strip()
+                            # Prefer HTTPS proxies if configured
+                            https_col = cols[6] if len(cols) > 6 else None
+                            is_https = https_col and https_col.text.strip().lower() == 'yes'
+                            protocol = 'https' if (CONFIG['proxy']['prefer_https'] and is_https) else 'http'
+                            if ip and port:
+                                proxies.append(f"{protocol}://{ip}:{port}")
         except Exception as e:
-            self.logger.debug(f"Error fetching proxies: {e}")
+            self.logger.debug(f"Error fetching proxies from {url}: {e}")
         
         return proxies[:CONFIG['proxy']['free_proxy_count']]
     
@@ -1153,7 +1195,7 @@ class ProxyManager:
         return delay + random.uniform(0, 0.5)
     
     def get_proxy(self, domain: str = None) -> Optional[str]:
-        """Get next working proxy with retry support"""
+        """Get next working proxy with quality scoring and domain awareness"""
         if not CONFIG['proxy']['enabled']:
             return None
         
@@ -1161,27 +1203,58 @@ class ProxyManager:
         self._cleanup_temp_blacklist()
         
         with self._lock:
-            available = self._working_proxies - self._blacklist - set(self._temp_blacklist.keys())
+            # Filter by domain blacklist
+            domain_excluded = self._domain_blacklist.get(domain, set()) if domain else set()
+            
+            available = list(self._working_proxies - self._blacklist - 
+                           set(self._temp_blacklist.keys()) - domain_excluded)
             
             if not available:
-                self.logger.warning("No working proxies available!")
+                # Fallback to any working proxy if domain-specific ones are exhausted
+                available = list(self._working_proxies - self._blacklist - 
+                               set(self._temp_blacklist.keys()))
+            
+            if not available:
+                self.logger.warning(f"No working proxies available for domain: {domain}")
                 return None
             
-            proxy = random.choice(list(available))
-            return proxy
+            # Quality scoring and filtering
+            scored_proxies = []
+            min_rate = CONFIG['proxy'].get('min_success_rate', 0.5)
+            
+            for p in available:
+                s = self._successes.get(p, 0)
+                f = self._failures.get(p, 0)
+                total = s + f
+                rate = s / total if total > 0 else 1.0
+                
+                # Always allow proxies with few attempts to prove themselves
+                if rate >= min_rate or total < 5:
+                    scored_proxies.append((p, rate))
+            
+            if not scored_proxies:
+                return random.choice(available)
+                
+            # Weighted random choice or just pick from best performing
+            scored_proxies.sort(key=lambda x: x[1], reverse=True)
+            top_count = max(1, len(scored_proxies) // 3)
+            return random.choice([p for p, _ in scored_proxies[:top_count]])
     
     def report_success(self, proxy: str, domain: str = None):
         """Report successful proxy use"""
         with self._lock:
             self._failures[proxy] = 0
+            self._successes[proxy] = self._successes.get(proxy, 0) + 1
             self._working_proxies.add(proxy)
-            # Remove from temp blacklist if present
+            # Remove from temp blacklist and domain blacklist
             self._temp_blacklist.pop(proxy, None)
             self._ssl_failures.discard(proxy)
+            if domain and domain in self._domain_blacklist:
+                self._domain_blacklist[domain].discard(proxy)
     
     def report_failure(self, proxy: str, domain: str = None, error: str = None):
         """
-        Report proxy failure with error type detection.
+        Report proxy failure with improved blacklisting strategy.
         
         Args:
             proxy: The proxy that failed
@@ -1189,37 +1262,41 @@ class ProxyManager:
             error: Error message for diagnostics
         """
         with self._lock:
-            # Detect error type
-            is_ssl_error = False
-            is_timeout = False
+            error_lower = error.lower() if error else ""
             
-            if error:
-                error_lower = error.lower()
-                is_ssl_error = 'ssl' in error_lower or 'certificate' in error_lower
-                is_timeout = 'timeout' in error_lower or 'timed out' in error_lower
+            # Immediate blacklist for critical errors
+            is_ssl_error = 'ssl' in error_lower or 'certificate' in error_lower
+            is_conn_error = 'refused' in error_lower or 'reset' in error_lower
+            is_timeout = 'timeout' in error_lower or 'timed out' in error_lower
             
-            # Handle SSL failures separately
-            if is_ssl_error:
-                self._ssl_failures.add(proxy)
-                # Don't immediately blacklist - might work for HTTP
-                if CONFIG['proxy']['prefer_https']:
-                    self._failures[proxy] = self._failures.get(proxy, 0) + 1
-            else:
-                self._failures[proxy] = self._failures.get(proxy, 0) + 1
+            self._failures[proxy] = self._failures.get(proxy, 0) + 1
             
+            # Track domain-specific failures
+            if domain:
+                if domain not in self._domain_blacklist:
+                    self._domain_blacklist[domain] = set()
+                self._domain_blacklist[domain].add(proxy)
+            
+            # Determine threshold
             max_failures = CONFIG['proxy']['max_failures_before_blacklist']
+            if is_ssl_error or is_conn_error:
+                max_failures = 1
+            elif is_timeout:
+                max_failures = min(max_failures, 2)
             
             if self._failures[proxy] >= max_failures:
-                if is_ssl_error and not CONFIG['proxy']['prefer_https']:
-                    # Temporary blacklist for SSL issues (might recover)
-                    self._temp_blacklist[proxy] = time.time() + 300  # 5 minutes
-                    self._working_proxies.discard(proxy)
-                    self.logger.debug(f"Temp blacklisted proxy (SSL): {proxy}")
-                else:
-                    # Permanent blacklist
+                # Use temp blacklist for recovery
+                recovery_time = CONFIG['proxy'].get('recovery_time', 300)
+                self._temp_blacklist[proxy] = time.time() + recovery_time
+                self._working_proxies.discard(proxy)
+                
+                # Check recovery limit
+                self._recovery_attempts[proxy] = self._recovery_attempts.get(proxy, 0) + 1
+                if self._recovery_attempts[proxy] > CONFIG['proxy'].get('max_recovery_attempts', 3):
                     self._blacklist.add(proxy)
-                    self._working_proxies.discard(proxy)
-                    self.logger.debug(f"Blacklisted proxy: {proxy}")
+                    self.logger.info(f"Permanently blacklisted proxy: {proxy}")
+                else:
+                    self.logger.debug(f"Temp blacklisted proxy ({error_lower}): {proxy}")
     
     def get_working_count(self) -> int:
         """Get count of working proxies"""
@@ -1322,26 +1399,38 @@ class HTTPClient:
         return any(keyword in error_str for keyword in ssl_keywords)
     
     @retry(
-        stop=stop_after_attempt(3),
+        stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=(retry_if_exception_type((requests.Timeout, requests.ConnectionError, requests.HTTPError))),
         reraise=True
     )
-    def get(self, url: str, allow_ssl_bypass: bool = False, **kwargs) -> requests.Response:
+    def get(self, url: str, allow_ssl_bypass: bool = None, **kwargs) -> requests.Response:
         """
-        Make GET request with retry and SSL handling.
+        Make GET request with retry, adaptive timeout, and SSL handling.
         
         Args:
             url: The URL to fetch
             allow_ssl_bypass: If True, retry with SSL verification disabled on failure
             **kwargs: Additional requests parameters
         """
+        if allow_ssl_bypass is None:
+            allow_ssl_bypass = CONFIG['proxy'].get('allow_unverified_ssl', True)
+            
         # Add fingerprint headers
         headers = FingerprintGenerator.get_random()
         headers.update(kwargs.pop('headers', {}))
         
+        # Domain context for proxy tracking
+        domain_match = re.findall(r'https?://([^/]+)', url)
+        domain = domain_match[0] if domain_match else None
+        
         # Add proxy
-        proxy = self.proxy_manager.get_proxy()
+        proxy = self.proxy_manager.get_proxy(domain=domain)
         proxies = {'http': proxy, 'https': proxy} if proxy else None
+        
+        # Timeouts
+        conn_timeout = CONFIG['proxy'].get('connect_timeout', 10)
+        read_timeout = CONFIG['proxy'].get('read_timeout', 10)
         
         # Add delay based on proxy failure count for backoff
         if proxy:
@@ -1359,24 +1448,32 @@ class HTTPClient:
                 url,
                 headers=headers,
                 proxies=proxies,
-                timeout=CONFIG['scraping']['request_timeout'],
+                timeout=(conn_timeout, read_timeout),
                 **kwargs
             )
             
+            # Handle rate limiting or server errors
+            if response.status_code in [429, 503]:
+                self.logger.warning(f"Server returned {response.status_code} for {url}")
+                if proxy:
+                    self.proxy_manager.report_failure(proxy, domain=domain, error=f"HTTP {response.status_code}")
+                response.raise_for_status() # Trigger retry
+                
             if proxy:
-                self.proxy_manager.report_success(proxy)
+                self.proxy_manager.report_success(proxy, domain=domain)
             
             response.raise_for_status()
             return response
             
         except requests.RequestException as e:
             if proxy:
-                self.proxy_manager.report_failure(proxy, error=str(e))
+                self.proxy_manager.report_failure(proxy, domain=domain, error=str(e))
             
             # If SSL error and allowed, retry with SSL verification disabled
             if self._detect_ssl_error(e) and allow_ssl_bypass:
-                self.logger.debug(f"SSL error, retrying without verification: {url}")
+                self.logger.warning(f"SSL verification failed for {url}, bypassing...")
                 kwargs['verify'] = False
+                # Use a fresh proxy for the bypass attempt if possible
                 return self.get(url, allow_ssl_bypass=False, **kwargs)
             
             self.logger.warning(f"Request failed: {url} - {e}")
@@ -1597,6 +1694,11 @@ class LinkedInScraper(BaseScraper):
     
     BASE_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._consecutive_empty_results = 0
+        self._circuit_breaker_until = 0
+    
     # CSS selector fallbacks for job cards (LinkedIn changes these frequently)
     CARD_SELECTORS = [
         ('div', 'base-card'),
@@ -1642,9 +1744,15 @@ class LinkedInScraper(BaseScraper):
     ]
     
     def scrape_all(self) -> List[Job]:
-        """Scrape all configured LinkedIn searches"""
+        """Scrape all configured LinkedIn searches with circuit breaker awareness"""
         if not CONFIG['linkedin']['enabled']:
             self.logger.info("LinkedIn scraper disabled")
+            return []
+        
+        # Check circuit breaker
+        if self._circuit_breaker_until > time.time():
+            wait_min = int((self._circuit_breaker_until - time.time()) / 60)
+            self.logger.warning(f"LinkedIn circuit breaker is OPEN. Skipping for {wait_min} more minutes.")
             return []
         
         all_jobs = []
@@ -1658,9 +1766,29 @@ class LinkedInScraper(BaseScraper):
         
         for keyword in keywords:
             for location in locations:
+                if self._circuit_breaker_until > time.time():
+                    break
+                    
                 try:
                     self.logger.info(f"Scraping LinkedIn: '{keyword}' in '{location}'")
+                    
+                    # Add randomized delay between searches
+                    search_delay = random.uniform(
+                        CONFIG['linkedin'].get('request_delay_min', 2) * 2,
+                        CONFIG['linkedin'].get('request_delay_max', 5) * 2
+                    )
+                    time.sleep(search_delay)
+                    
                     jobs = self._scrape_public_api(keyword, location)
+                    
+                    if not jobs:
+                        self._consecutive_empty_results += 1
+                        if self._consecutive_empty_results >= 3:
+                            self._trigger_circuit_breaker()
+                            break
+                    else:
+                        self._consecutive_empty_results = 0
+                        
                     all_jobs.extend(jobs)
                     self.stats['found'] += len(jobs)
                 except Exception as e:
@@ -1668,7 +1796,12 @@ class LinkedInScraper(BaseScraper):
                     self.stats['errors'] += 1
         
         return all_jobs
-    
+
+    def _trigger_circuit_breaker(self, minutes: int = 30):
+        """Trigger the circuit breaker to pause scraping"""
+        self._circuit_breaker_until = time.time() + (minutes * 60)
+        self.logger.error(f"🚨 LinkedIn Circuit Breaker triggered! Pausing LinkedIn scraping for {minutes} minutes due to repeated empty results.")
+
     def _scrape_public_api(self, keyword: str, location: str) -> List[Job]:
         """Scrape using public guest API with diagnostic logging"""
         jobs = []
@@ -1689,6 +1822,14 @@ class LinkedInScraper(BaseScraper):
             
             try:
                 response = self.http.get(url)
+                
+                # Check for anti-bot patterns
+                lower_content = response.text.lower()
+                if any(p in lower_content for p in ["security check", "quick security check", "captcha", "please verify you are a human"]):
+                    self.logger.error(f"LinkedIn anti-bot detection triggered for '{keyword}' in '{location}'")
+                    self._trigger_circuit_breaker(60) # Pause for 1 hour
+                    break
+                
                 soup = BeautifulSoup(response.text, 'lxml')
                 
                 # Try each selector combination
