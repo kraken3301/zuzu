@@ -36,7 +36,12 @@ from urllib.parse import urlencode, quote_plus
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
+
+try:
+    from fake_useragent import UserAgent  # type: ignore
+except ImportError:  # pragma: no cover
+    UserAgent = None  # type: ignore
+
 import feedparser
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -63,6 +68,23 @@ try:
     IN_COLAB = True
 except ImportError:
     IN_COLAB = False
+
+FALLBACK_USER_AGENTS: List[str] = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+]
+
+
+def get_random_user_agent() -> str:
+    if UserAgent is not None:
+        try:
+            return UserAgent().random
+        except Exception:
+            pass
+
+    return random.choice(FALLBACK_USER_AGENTS)
 
 # ============================================================================
 # CELL 2: GOOGLE DRIVE MOUNT & DIRECTORY SETUP
@@ -1006,7 +1028,7 @@ class ProxyManager:
         """Fetch proxies from a source URL"""
         proxies = []
         try:
-            headers = {'User-Agent': UserAgent().random}
+            headers = {'User-Agent': get_random_user_agent()}
             response = requests.get(url, headers=headers, timeout=10)
             soup = BeautifulSoup(response.text, 'html.parser')
             
