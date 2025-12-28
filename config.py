@@ -160,12 +160,39 @@ GOVT_RSS_FEEDS = [
 ]
 
 # Government Jobs Scraping Settings
-GOVT_SCRAPING_TIMEOUT = 10  # seconds per feed request
+GOVT_SCRAPING_TIMEOUT = 5   # seconds per feed request (reduced for faster failover)
 GOVT_SCRAPING_RETRIES = 3   # retry attempts per failed feed
 GOVT_ENABLED = True         # Enable/disable government jobs scraping
 
+# Government Job Feed Optimization - Primary (fast, high-quality)
+GOVT_FEEDS_PRIMARY = [
+    'https://www.freejobalert.com/feed',
+    'https://www.sarkariexams.com/feed',
+]
+
+# Government Job Feed Optimization - Secondary (backup feeds)
+GOVT_FEEDS_SECONDARY = [
+    'https://www.sarkariresultadda.com/feed',
+    'https://sarkariexamresult.com/feed',
+    'https://www.govtjobsind.com/feed',
+    'https://www.jobhunts.in/feed',
+]
+
+# Government Feed Advanced Settings
+GOVT_FEED_PARALLEL = True           # Enable parallel feed fetching
+GOVT_FEED_PARALLEL_WORKERS = 3      # Max concurrent feed requests
+GOVT_USE_SECONDARY_ON_FAILURE = True # Fall back to secondary feeds if primary fails
+
 # User Agent for HTTP requests
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+# Advanced Naukri Settings (Professional Grade)
+NAUKRI_USER_AGENT_ROTATION = True   # Rotate UA on each request
+NAUKRI_SESSION_ENABLED = True        # Use session with cookies
+NAUKRI_RETRY_ATTEMPTS = 3            # Exponential backoff retries
+NAUKRI_RETRY_BACKOFF = 2             # Exponential multiplier
+NAUKRI_SMART_DELAYS = True           # Random delays with occasional longer pauses
+NAUKRI_MAX_TIMEOUT = 15              # Request timeout in seconds
 
 # Proxy Configuration
 PROXY_ENABLED = False  # Set to False for PythonAnywhere/Replit
