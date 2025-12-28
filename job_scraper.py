@@ -220,6 +220,7 @@ CONFIG = {
     'naukri': {
         'enabled': True,
         'use_api': True,                      # Mobile API (preferred)
+        'session_enabled': True,              # Use requests session for connection reuse
         'keywords': [
             'fresher software',
             'entry level developer',
@@ -439,6 +440,16 @@ try:
         CONFIG['naukri']['enabled'] = config.NAUKRI_ENABLED
     if hasattr(config, 'NAUKRI_USE_API'):
         CONFIG['naukri']['use_api'] = config.NAUKRI_USE_API
+    
+    # Override Advanced Naukri settings (Professional Grade)
+    if hasattr(config, 'NAUKRI_USER_AGENT_ROTATION'):
+        CONFIG['naukri']['user_agent_rotation'] = config.NAUKRI_USER_AGENT_ROTATION
+    if hasattr(config, 'NAUKRI_SESSION_ENABLED'):
+        CONFIG['naukri']['session_enabled'] = config.NAUKRI_SESSION_ENABLED
+    if hasattr(config, 'NAUKRI_RETRY_ATTEMPTS'):
+        CONFIG['naukri']['max_retries'] = config.NAUKRI_RETRY_ATTEMPTS
+    if hasattr(config, 'NAUKRI_MAX_TIMEOUT'):
+        CONFIG['naukri']['timeout'] = config.NAUKRI_MAX_TIMEOUT
     
     # Override Superset settings
     if hasattr(config, 'SUPERSET_ENABLED'):
@@ -2268,9 +2279,16 @@ class IndeedScraper(BaseScraper):
 # ============================================================================
 
 class NaukriScraper(BaseScraper):
-    """Naukri.com job scraper"""
+    """Naukri.com job scraper with professional-grade reliability"""
     
     API_URL = "https://www.naukri.com/jobapi/v3/search"
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize session for connection reuse
+        self.session = requests.Session() if CONFIG.get('naukri', {}).get('session_enabled', True) else None
+        if self.session:
+            self.session.headers.update({'User-Agent': self._get_random_user_agent()})
     
     def scrape_all(self) -> List[Job]:
         """Scrape all configured Naukri searches"""
@@ -2289,7 +2307,7 @@ class NaukriScraper(BaseScraper):
         for keyword in keywords:
             for location in locations:
                 try:
-                    self.logger.info(f"Scraping Naukri: '{keyword}' in '{location}'")
+                    self.logger.info(f"📡 Naukri Request: {keyword} in {location}")
                     
                     if CONFIG['naukri']['use_api']:
                         jobs = self._scrape_via_api(keyword, location)
@@ -2298,24 +2316,97 @@ class NaukriScraper(BaseScraper):
                     
                     all_jobs.extend(jobs)
                     self.stats['found'] += len(jobs)
+                    self.logger.info(f"   ✅ Found {len(jobs)} Naukri jobs for '{keyword}' in '{location}'")
                 except Exception as e:
-                    self.logger.error(f"Naukri scrape error: {e}")
+                    self.logger.error(f"   ❌ Naukri scrape error: {e}")
                     self.stats['errors'] += 1
         
         return all_jobs
     
+    def _get_random_user_agent(self) -> str:
+        """Get random desktop User-Agent for rotation"""
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+        ]
+        return random.choice(user_agents)
+    
     def _get_api_headers(self) -> dict:
-        """Get headers for Naukri API (Updated to bypass 406 Block)"""
-        return {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        """Get realistic browser headers with variation"""
+        accept_languages = [
+            'en-US,en;q=0.9',
+            'en-GB,en;q=0.9,en-US;q=0.8',
+            'en-US,en;q=0.9,hi;q=0.8',
+            'en;q=0.9',
+        ]
+        
+        headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': random.choice(accept_languages),
+            'User-Agent': self._get_random_user_agent(),
             'Client-Device': 'desktop',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.naukri.com/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
         }
+        
+        return headers
+    
+    def _smart_delay(self, min_delay: float = 5.0, max_delay: float = 10.0):
+        """Randomized delay to simulate human browsing"""
+        delay = random.uniform(min_delay, max_delay)
+        
+        # Occasional longer pauses (5% chance) to look more human
+        if random.random() < 0.05:
+            extra_delay = random.uniform(10, 20)
+            self.logger.debug(f"   ⏸️ Extra pause: {extra_delay:.1f}s")
+            delay += extra_delay
+        
+        time.sleep(delay)
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type((requests.RequestException, ConnectionError))
+    )
+    def _make_api_request_with_retry(self, url: str, params: dict, headers: dict) -> requests.Response:
+        """Make API request with automatic exponential backoff"""
+        # Use session if available, otherwise use requests
+        http_client = self.session if self.session else requests
+        
+        response = http_client.get(url, params=params, headers=headers, timeout=15)
+        
+        # Handle specific error codes
+        if response.status_code == 406:
+            # 406: Not Acceptable - Rotate UA and retry
+            self.logger.warning(f"   ⚠️ 406 detected, rotating User-Agent and retrying...")
+            headers['User-Agent'] = self._get_random_user_agent()
+            raise requests.RequestException("406 detected, retrying with new UA")
+        elif response.status_code == 429:
+            # 429: Too Many Requests - Wait longer
+            self.logger.warning(f"   ⚠️ 429 Rate limit detected, waiting 30s...")
+            time.sleep(30)
+            raise requests.RequestException("429 rate limit, retrying after delay")
+        elif response.status_code >= 500:
+            # 500+: Server error - Will be handled by @retry decorator
+            self.logger.warning(f"   ⚠️ Server error {response.status_code}, retrying with backoff...")
+            raise requests.RequestException(f"Server error {response.status_code}")
+        
+        response.raise_for_status()
+        return response
     
     def _scrape_via_api(self, keyword: str, location: str) -> List[Job]:
-        """Scrape using mobile API"""
+        """Scrape using mobile API with professional-grade reliability"""
         jobs = []
         
         for page in range(1, CONFIG['naukri']['max_pages_per_search'] + 1):
@@ -2331,21 +2422,20 @@ class NaukriScraper(BaseScraper):
                     'pageNo': page,
                 }
                 
-                response = requests.get(
-                    self.API_URL,
-                    params=params,
-                    headers=self._get_api_headers(),
-                    timeout=CONFIG['scraping']['request_timeout']
-                )
+                # Get fresh headers with rotated UA
+                headers = self._get_api_headers()
+                self.logger.debug(f"   Using UA: {headers['User-Agent'][:50]}...")
                 
-                if response.status_code != 200:
-                    self.logger.warning(f"Naukri API returned {response.status_code}")
-                    break
+                # Make request with retry logic
+                response = self._make_api_request_with_retry(self.API_URL, params, headers)
+                
+                self.logger.debug(f"   Status: {response.status_code}")
                 
                 data = response.json()
                 job_list = data.get('jobDetails', [])
                 
                 if not job_list:
+                    self.logger.debug(f"   No more jobs found on page {page}")
                     break
                 
                 for job_data in job_list:
@@ -2356,15 +2446,17 @@ class NaukriScraper(BaseScraper):
                     except Exception as e:
                         self.logger.debug(f"Failed to parse API response: {e}")
                 
-                # Delay between pages
-                time.sleep(random.uniform(1, 2))
+                # Smart delay between pages
+                if page < CONFIG['naukri']['max_pages_per_search']:
+                    self._smart_delay(min_delay=CONFIG['scraping']['delay_min'], 
+                                    max_delay=CONFIG['scraping']['delay_max'])
                 
             except Exception as e:
-                self.logger.warning(f"Naukri API request failed: {e}")
-                time.sleep(10)
+                self.logger.error(f"   ❌ Naukri API request failed after retries: {e}")
+                self.stats['errors'] += 1
+                # Don't break, try next page
                 continue
         
-        self.logger.info(f"Found {len(jobs)} Naukri jobs for '{keyword}'")
         return jobs
     
     def _parse_api_response(self, data: dict, keyword: str) -> Optional[Job]:
@@ -2705,56 +2797,202 @@ class SupersetScraper(BaseScraper):
 # ============================================================================
 
 class GovernmentJobsScraper(BaseScraper):
-    """Government jobs RSS feed scraper with robust error handling"""
+    """Government jobs RSS feed scraper with parallel fetching and fallback"""
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._feed_results = {}  # Track success/failure per feed
+        self._feed_performance = {}  # Track response times
     
     def scrape_all(self) -> List[Job]:
-        """Scrape all configured government job RSS feeds"""
+        """Scrape government job RSS feeds with parallel optimization"""
         if not CONFIG['govt']['enabled']:
             self.logger.info("Government jobs scraper disabled")
             return []
         
         all_jobs = []
-        feeds = CONFIG['govt']['rss_feeds']
         self._feed_results = {}
+        self._feed_performance = {}
+        
+        # Try optimized config first (primary + secondary feeds)
+        try:
+            import config as user_config
+            primary_feeds = getattr(user_config, 'GOVT_FEEDS_PRIMARY', None)
+            secondary_feeds = getattr(user_config, 'GOVT_FEEDS_SECONDARY', None)
+            use_parallel = getattr(user_config, 'GOVT_FEED_PARALLEL', False)
+            use_secondary = getattr(user_config, 'GOVT_USE_SECONDARY_ON_FAILURE', False)
+        except:
+            primary_feeds = None
+            secondary_feeds = None
+            use_parallel = False
+            use_secondary = False
+        
+        # Fallback to original feeds if config not available
+        if not primary_feeds:
+            feeds = CONFIG['govt']['rss_feeds']
+            self.logger.info(f"Using standard feed configuration ({len(feeds)} feeds)")
+            return self._scrape_feeds_sequential(feeds)
+        
+        # Use optimized parallel scraping
+        self.logger.info(f"🚀 Using optimized parallel feed fetching")
+        self.logger.info(f"   Primary feeds: {len(primary_feeds)}")
+        
+        start_time = time.time()
+        
+        # Scrape primary feeds in parallel
+        if use_parallel:
+            primary_jobs = self._scrape_feeds_parallel(primary_feeds)
+        else:
+            primary_jobs = self._scrape_feeds_sequential(primary_feeds)
+        
+        all_jobs.extend(primary_jobs)
+        
+        # If primary feeds failed or returned few jobs, try secondary
+        if use_secondary and len(primary_jobs) < 10:
+            self.logger.info(f"⚠️ Primary feeds returned only {len(primary_jobs)} jobs, trying secondary feeds...")
+            if use_parallel:
+                secondary_jobs = self._scrape_feeds_parallel(secondary_feeds)
+            else:
+                secondary_jobs = self._scrape_feeds_sequential(secondary_feeds)
+            all_jobs.extend(secondary_jobs)
+        
+        # Deduplicate jobs
+        unique_jobs = self._deduplicate_jobs(all_jobs)
+        self.stats['found'] = len(unique_jobs)
+        
+        total_time = time.time() - start_time
+        
+        # Log performance report
+        self._log_performance_report(unique_jobs, total_time)
+        
+        return unique_jobs
+    
+    def _scrape_feeds_parallel(self, feeds: List[str]) -> List[Job]:
+        """Scrape multiple feeds in parallel for speed"""
+        all_jobs = []
+        
+        try:
+            import config as user_config
+            max_workers = getattr(user_config, 'GOVT_FEED_PARALLEL_WORKERS', 3)
+        except:
+            max_workers = 3
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            from concurrent.futures import as_completed
+            
+            # Submit all feeds for parallel processing
+            future_to_feed = {
+                executor.submit(self._scrape_single_feed_timed, feed): feed
+                for feed in feeds
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_feed):
+                feed_url = future_to_feed[future]
+                try:
+                    jobs, elapsed_time = future.result()
+                    if jobs:
+                        all_jobs.extend(jobs)
+                        self._feed_results[feed_url] = {'success': True, 'count': len(jobs)}
+                        self._feed_performance[feed_url] = elapsed_time
+                        self.logger.info(f"✅ {self._get_feed_name(feed_url)}: {len(jobs)} jobs ({elapsed_time:.1f}s)")
+                    else:
+                        self._feed_results[feed_url] = {'success': True, 'count': 0}
+                        self._feed_performance[feed_url] = elapsed_time
+                        self.logger.debug(f"⏭️ {self._get_feed_name(feed_url)}: 0 jobs ({elapsed_time:.1f}s)")
+                except Exception as e:
+                    self.logger.error(f"❌ {self._get_feed_name(feed_url)}: {e}")
+                    self._feed_results[feed_url] = {'success': False, 'error': str(e)}
+                    self.stats['errors'] += 1
+        
+        return all_jobs
+    
+    def _scrape_feeds_sequential(self, feeds: List[str]) -> List[Job]:
+        """Scrape feeds sequentially (fallback method)"""
+        all_jobs = []
         
         for feed_url in feeds:
             try:
                 self.logger.info(f"Scraping government feed: {feed_url}")
+                start_time = time.time()
                 jobs = self._scrape_feed_with_retry(feed_url)
+                elapsed_time = time.time() - start_time
                 
                 if jobs:
                     all_jobs.extend(jobs)
                     self._feed_results[feed_url] = {'success': True, 'count': len(jobs)}
-                    self.logger.info(f"✅ Found {len(jobs)} jobs from {feed_url}")
+                    self._feed_performance[feed_url] = elapsed_time
+                    self.logger.info(f"✅ Found {len(jobs)} jobs from {feed_url} ({elapsed_time:.1f}s)")
                 else:
                     self._feed_results[feed_url] = {'success': True, 'count': 0}
-                    self.logger.info(f"✅ Feed {feed_url} processed (0 jobs)")
+                    self._feed_performance[feed_url] = elapsed_time
+                    self.logger.info(f"✅ Feed {feed_url} processed (0 jobs, {elapsed_time:.1f}s)")
                 
                 # Respect delay between feeds
-                time.sleep(random.uniform(
-                    CONFIG['scraping']['delay_min'],
-                    CONFIG['scraping']['delay_max']
-                ))
+                time.sleep(random.uniform(1, 2))
                 
             except Exception as e:
                 self.logger.error(f"❌ Failed to scrape {feed_url}: {e}")
                 self._feed_results[feed_url] = {'success': False, 'error': str(e)}
                 self.stats['errors'] += 1
         
-        # Deduplicate jobs
-        unique_jobs = self._deduplicate_jobs(all_jobs)
-        self.stats['found'] = len(unique_jobs)
+        return all_jobs
+    
+    def _scrape_single_feed_timed(self, feed_url: str) -> Tuple[List[Job], float]:
+        """Scrape a single feed and return jobs with elapsed time"""
+        start_time = time.time()
+        jobs = self._scrape_feed_with_retry(feed_url)
+        elapsed_time = time.time() - start_time
+        return jobs, elapsed_time
+    
+    def _get_feed_name(self, feed_url: str) -> str:
+        """Extract readable feed name from URL"""
+        if 'freejobalert' in feed_url:
+            return "FreeJobAlert"
+        elif 'sarkariexams' in feed_url:
+            return "SarkariExams"
+        elif 'sarkariresultadda' in feed_url:
+            return "SarkariResultAdda"
+        elif 'sarkariexamresult' in feed_url:
+            return "SarkariExamResult"
+        elif 'govtjobsind' in feed_url:
+            return "GovtJobsIn"
+        elif 'jobhunts' in feed_url:
+            return "JobHunts"
+        else:
+            return feed_url.split('/')[2] if '/' in feed_url else feed_url
+    
+    def _log_performance_report(self, unique_jobs: List[Job], total_time: float):
+        """Log detailed performance report"""
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"📊 Government Jobs Feed Performance Report")
+        self.logger.info(f"{'='*60}")
         
-        # Log summary
+        # Sort feeds by performance (successful first, then by speed)
+        sorted_feeds = sorted(
+            self._feed_results.items(),
+            key=lambda x: (not x[1].get('success', False), self._feed_performance.get(x[0], 999))
+        )
+        
+        for feed_url, result in sorted_feeds:
+            feed_name = self._get_feed_name(feed_url)
+            if result.get('success'):
+                count = result.get('count', 0)
+                elapsed = self._feed_performance.get(feed_url, 0)
+                self.logger.info(f"✅ {feed_name:20s}: {count:3d} jobs ({elapsed:5.1f}s)")
+            else:
+                error = result.get('error', 'Unknown error')[:40]
+                self.logger.info(f"❌ {feed_name:20s}: Failed ({error})")
+        
         success_count = sum(1 for r in self._feed_results.values() if r.get('success'))
+        total_feeds = len(self._feed_results)
         total_jobs = sum(r.get('count', 0) for r in self._feed_results.values())
-        self.logger.info(f"Government jobs scraper: {success_count}/{len(feeds)} feeds successful, {total_jobs} total jobs, {len(unique_jobs)} unique")
         
-        return unique_jobs
+        self.logger.info(f"{'='*60}")
+        self.logger.info(f"Summary: {success_count}/{total_feeds} feeds successful")
+        self.logger.info(f"Total: {total_jobs} jobs → {len(unique_jobs)} unique")
+        self.logger.info(f"Time: {total_time:.1f} seconds")
+        self.logger.info(f"{'='*60}\n")
     
     def _scrape_feed_with_retry(self, feed_url: str, max_retries: int = None) -> List[Job]:
         """Scrape a single feed with retry logic"""
