@@ -149,6 +149,24 @@ SUPERSET_EMAIL = ""
 SUPERSET_PASSWORD = ""
 SUPERSET_COLLEGE_CODE = ""
 
+# --- GOVERNMENT JOBS RSS CONFIGURATION ---
+GOVT_RSS_FEEDS = [
+    'https://www.freejobalert.com/feed',
+    'https://www.sarkariresultadda.com/feed',
+    'https://sarkariexamresult.com/feed',
+    'https://www.govtjobsind.com/feed',
+    'https://www.sarkariexams.com/feed',
+    'https://www.jobhunts.in/feed',
+]
+
+# Government Jobs Scraping Settings
+GOVT_SCRAPING_TIMEOUT = 10  # seconds per feed request
+GOVT_SCRAPING_RETRIES = 3   # retry attempts per failed feed
+GOVT_ENABLED = True         # Enable/disable government jobs scraping
+
+# User Agent for HTTP requests
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
 # Proxy Configuration
 PROXY_ENABLED = False  # Set to False for PythonAnywhere/Replit
 PROXY_USE_FREE = False

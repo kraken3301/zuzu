@@ -269,6 +269,25 @@ CONFIG = {
     },
     
     # =========================================================================
+    # GOVERNMENT JOBS SETTINGS
+    # =========================================================================
+    'govt': {
+        'enabled': True,
+        'rss_feeds': [
+            'https://www.freejobalert.com/feed',
+            'https://www.sarkariresultadda.com/feed',
+            'https://sarkariexamresult.com/feed',
+            'https://www.govtjobsind.com/feed',
+            'https://www.sarkariexams.com/feed',
+            'https://www.jobhunts.in/feed',
+        ],
+        'timeout': 10,                        # seconds per feed request
+        'max_retries': 3,                     # retry attempts per failed feed
+        'max_jobs_per_feed': 20,              # max jobs to extract per feed
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    },
+    
+    # =========================================================================
     # PROXY SETTINGS
     # =========================================================================
     'proxy': {
@@ -471,6 +490,18 @@ try:
     if hasattr(config, 'MAX_JOB_AGE_DAYS'):
         CONFIG['data']['max_age_days'] = config.MAX_JOB_AGE_DAYS
     
+    # Override Government Jobs settings
+    if hasattr(config, 'GOVT_ENABLED'):
+        CONFIG['govt']['enabled'] = config.GOVT_ENABLED
+    if hasattr(config, 'GOVT_RSS_FEEDS'):
+        CONFIG['govt']['rss_feeds'] = config.GOVT_RSS_FEEDS
+    if hasattr(config, 'GOVT_SCRAPING_TIMEOUT'):
+        CONFIG['govt']['timeout'] = config.GOVT_SCRAPING_TIMEOUT
+    if hasattr(config, 'GOVT_SCRAPING_RETRIES'):
+        CONFIG['govt']['max_retries'] = config.GOVT_SCRAPING_RETRIES
+    if hasattr(config, 'USER_AGENT'):
+        CONFIG['govt']['user_agent'] = config.USER_AGENT
+    
     print("✅ Configuration loaded from config.py")
     print(f"   LinkedIn keywords: {len(CONFIG['linkedin']['keywords'])}")
     print(f"   Indeed keywords: {len(CONFIG['indeed']['keywords'])}")
@@ -500,6 +531,7 @@ def validate_config() -> Tuple[bool, List[str]]:
         CONFIG['indeed']['enabled'],
         CONFIG['naukri']['enabled'],
         CONFIG['superset']['enabled'],
+        CONFIG['govt']['enabled'],
     ])
     if not scrapers_enabled:
         errors.append("At least one scraper must be enabled")
@@ -563,7 +595,8 @@ class Job:
         """Format job for Telegram posting"""
         source_emoji = {
             'linkedin': '🔗', 'indeed': '📋',
-            'naukri': '🇮🇳', 'superset': '🎓'
+            'naukri': '🇮🇳', 'superset': '🎓',
+            'govt': '🏛'
         }
         
         lines = [
@@ -627,6 +660,10 @@ class ScrapingStats:
     superset_new: int = 0
     superset_errors: int = 0
     
+    govt_jobs: int = 0
+    govt_new: int = 0
+    govt_errors: int = 0
+    
     total_requests: int = 0
     failed_requests: int = 0
     proxies_used: int = 0
@@ -637,11 +674,11 @@ class ScrapingStats:
     
     @property
     def total_jobs(self) -> int:
-        return self.linkedin_jobs + self.indeed_jobs + self.naukri_jobs + self.superset_jobs
+        return self.linkedin_jobs + self.indeed_jobs + self.naukri_jobs + self.superset_jobs + self.govt_jobs
     
     @property
     def total_new(self) -> int:
-        return self.linkedin_new + self.indeed_new + self.naukri_new + self.superset_new
+        return self.linkedin_new + self.indeed_new + self.naukri_new + self.superset_new + self.govt_new
     
     def get_runtime(self) -> str:
         end = self.end_time or datetime.now()
@@ -666,6 +703,7 @@ Jobs Found:
 📋 Indeed: {self.indeed_jobs} ({self.indeed_new} new)
 🇮🇳 Naukri: {self.naukri_jobs} ({self.naukri_new} new)
 🎓 Superset: {self.superset_jobs} ({self.superset_new} new)
+🏛 Government: {self.govt_jobs} ({self.govt_new} new)
 
 Totals:
 📥 Total Found: {self.total_jobs}
@@ -2659,6 +2697,284 @@ class SupersetScraper(BaseScraper):
 
 
 # ============================================================================
+# CELL 15B: GOVERNMENT JOBS SCRAPER
+# ============================================================================
+# Description: Government jobs RSS feed scraper
+# Scrapes Indian government job RSS feeds with retry logic and timeout handling
+# ============================================================================
+
+class GovernmentJobsScraper(BaseScraper):
+    """Government jobs RSS feed scraper with robust error handling"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._feed_results = {}  # Track success/failure per feed
+    
+    def scrape_all(self) -> List[Job]:
+        """Scrape all configured government job RSS feeds"""
+        if not CONFIG['govt']['enabled']:
+            self.logger.info("Government jobs scraper disabled")
+            return []
+        
+        all_jobs = []
+        feeds = CONFIG['govt']['rss_feeds']
+        self._feed_results = {}
+        
+        for feed_url in feeds:
+            try:
+                self.logger.info(f"Scraping government feed: {feed_url}")
+                jobs = self._scrape_feed_with_retry(feed_url)
+                
+                if jobs:
+                    all_jobs.extend(jobs)
+                    self._feed_results[feed_url] = {'success': True, 'count': len(jobs)}
+                    self.logger.info(f"✅ Found {len(jobs)} jobs from {feed_url}")
+                else:
+                    self._feed_results[feed_url] = {'success': True, 'count': 0}
+                    self.logger.info(f"✅ Feed {feed_url} processed (0 jobs)")
+                
+                # Respect delay between feeds
+                time.sleep(random.uniform(
+                    CONFIG['scraping']['delay_min'],
+                    CONFIG['scraping']['delay_max']
+                ))
+                
+            except Exception as e:
+                self.logger.error(f"❌ Failed to scrape {feed_url}: {e}")
+                self._feed_results[feed_url] = {'success': False, 'error': str(e)}
+                self.stats['errors'] += 1
+        
+        # Deduplicate jobs
+        unique_jobs = self._deduplicate_jobs(all_jobs)
+        self.stats['found'] = len(unique_jobs)
+        
+        # Log summary
+        success_count = sum(1 for r in self._feed_results.values() if r.get('success'))
+        total_jobs = sum(r.get('count', 0) for r in self._feed_results.values())
+        self.logger.info(f"Government jobs scraper: {success_count}/{len(feeds)} feeds successful, {total_jobs} total jobs, {len(unique_jobs)} unique")
+        
+        return unique_jobs
+    
+    def _scrape_feed_with_retry(self, feed_url: str, max_retries: int = None) -> List[Job]:
+        """Scrape a single feed with retry logic"""
+        max_retries = max_retries or CONFIG['govt']['max_retries']
+        timeout = CONFIG['govt']['timeout']
+        
+        for attempt in range(max_retries):
+            try:
+                return self._fetch_and_parse_feed(feed_url, timeout)
+            except Exception as e:
+                self.logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {feed_url}: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt)  # Exponential backoff
+                    time.sleep(wait_time)
+        
+        self.logger.error(f"All {max_retries} attempts failed for {feed_url}")
+        return []
+    
+    def _fetch_and_parse_feed(self, feed_url: str, timeout: int) -> List[Job]:
+        """Fetch and parse RSS feed with proper headers"""
+        jobs = []
+        
+        headers = {
+            'User-Agent': CONFIG['govt']['user_agent'],
+            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        
+        # First, try to fetch with requests for better control
+        try:
+            response = requests.get(feed_url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            
+            # Parse with feedparser
+            feed = feedparser.parse(response.content)
+        except requests.exceptions.RequestException as e:
+            self.logger.warning(f"Request failed for {feed_url}, trying feedparser directly: {e}")
+            # Fallback to feedparser directly
+            feed = feedparser.parse(feed_url)
+        
+        # Check if feed has entries
+        if not hasattr(feed, 'entries') or not feed.entries:
+            self.logger.debug(f"No entries found in feed: {feed_url}")
+            return jobs
+        
+        max_jobs = CONFIG['govt']['max_jobs_per_feed']
+        max_age_days = CONFIG['data']['max_job_age_days']
+        cutoff_date = datetime.now() - timedelta(days=max_age_days)
+        
+        for entry in feed.entries[:max_jobs]:
+            try:
+                job = self._parse_rss_entry(entry, feed_url, cutoff_date)
+                if job:
+                    jobs.append(job)
+            except Exception as e:
+                self.logger.debug(f"Failed to parse entry from {feed_url}: {e}")
+                continue
+        
+        return jobs
+    
+    def _parse_rss_entry(self, entry, feed_url: str, cutoff_date: datetime) -> Optional[Job]:
+        """Parse a single RSS entry into a Job object"""
+        try:
+            # Extract title - validate it exists
+            title = entry.get('title', '')
+            if not title or not title.strip():
+                return None
+            
+            # Clean up title - remove extra whitespace
+            title = ' '.join(title.split()).strip()
+            
+            # Extract link - validate URL format
+            link = entry.get('link', '')
+            if not link:
+                return None
+            
+            # Ensure link is a valid URL
+            if not link.startswith('http'):
+                return None
+            
+            # Extract published date
+            posted_date = self._parse_date(entry)
+            
+            # Skip if job is too old
+            if posted_date and posted_date < cutoff_date:
+                return None
+            
+            # Extract and clean description/summary
+            description = ""
+            if hasattr(entry, 'summary') and entry.summary:
+                soup = BeautifulSoup(entry.summary, 'html.parser')
+                description = soup.get_text(strip=True)[:500]
+            elif hasattr(entry, 'description') and entry.description:
+                soup = BeautifulSoup(entry.description, 'html.parser')
+                description = soup.get_text(strip=True)[:500]
+            
+            # Extract source/company from title or feed
+            company = self._extract_company(title, feed_url)
+            
+            # Extract location (often embedded in title for govt jobs)
+            location = self._extract_location(title, description)
+            
+            # Generate unique ID
+            job_id = Job.generate_id(title, company, 'govt')
+            
+            return Job(
+                id=job_id,
+                title=title,
+                company=company,
+                location=location or "India",
+                source='govt',
+                url=link,
+                description=description,
+                posted_date=posted_date,
+                job_type="Government",
+            )
+        except Exception as e:
+            self.logger.debug(f"Error parsing RSS entry: {e}")
+            return None
+    
+    def _parse_date(self, entry) -> Optional[datetime]:
+        """Parse date from RSS entry with multiple format support"""
+        date_formats = [
+            '%a, %d %b %Y %H:%M:%S %z',  # RFC 2822: Mon, 01 Jan 2024 12:00:00 +0000
+            '%a, %d %b %Y %H:%M:%S %Z',  # RFC 2822 with timezone name
+            '%Y-%m-%dT%H:%M:%S%z',       # ISO 8601
+            '%Y-%m-%dT%H:%M:%S',         # ISO 8601 without timezone
+            '%Y-%m-%d',                   # Simple date
+            '%d %b %Y',                   # 01 Jan 2024
+            '%B %d, %Y',                  # January 01, 2024
+        ]
+        
+        # Try published date first
+        for date_field in ['published', 'updated', 'created']:
+            if hasattr(entry, date_field):
+                date_str = getattr(entry, date_field)
+                if date_str:
+                    for fmt in date_formats:
+                        try:
+                            # Handle timezone offset
+                            if '%z' in fmt and date_str.endswith(' GMT'):
+                                date_str = date_str.replace(' GMT', ' +0000')
+                            return datetime.strptime(date_str, fmt)
+                        except ValueError:
+                            continue
+        
+        return None
+    
+    def _extract_company(self, title: str, feed_url: str) -> str:
+        """Extract company/organization from title or feed URL"""
+        # Common government organizations
+        govt_orgs = [
+            'SSC', 'UPSC', 'Railway', 'RRB', 'Bank', 'IBPS', 'SBI', 'PSU',
+            'NIT', 'IIT', 'University', 'AIIMS', 'DRDO', 'ISRO', 'BARC',
+            'Govt', 'Government', 'Public', 'Defence', 'Police', 'Army',
+        ]
+        
+        # Check if title contains known organization
+        for org in govt_orgs:
+            if org.lower() in title.lower():
+                return org
+        
+        # Extract from feed URL
+        if 'freejobalert' in feed_url:
+            return "FreeJobAlert"
+        elif 'sarkariresultadda' in feed_url:
+            return "SarkariResultAdda"
+        elif 'sarkariexamresult' in feed_url:
+            return "SarkariExamResult"
+        elif 'govtjobsind' in feed_url:
+            return "GovtJobsIn"
+        elif 'sarkariexams' in feed_url:
+            return "SarkariExams"
+        elif 'jobhunts' in feed_url:
+            return "JobHunts"
+        
+        return "Government"
+    
+    def _extract_location(self, title: str, description: str) -> str:
+        """Extract location from title or description"""
+        # Common Indian locations in job titles
+        indian_locations = [
+            'Delhi', 'Mumbai', 'Bangalore', 'Chennai', 'Kolkata', 'Hyderabad',
+            'Pune', 'Ahmedabad', 'Jaipur', 'Lucknow', 'Kanpur', 'Nagpur',
+            'Indore', 'Bhopal', 'Patna', 'Ranchi', 'Chandigarh', 'Bhubaneswar',
+            'Srinagar', 'Jammu', 'Kashmir', 'Gujarat', 'Maharashtra', 'Tamil Nadu',
+            'Karnataka', 'Kerala', 'West Bengal', 'Uttar Pradesh', 'Rajasthan',
+            'Madhya Pradesh', 'Jharkhand', ' Bihar', 'Odisha', 'Punjab',
+            'Haryana', 'Uttarakhand', 'Himachal Pradesh', 'Assam', 'Meghalaya',
+            'Nagaland', 'Manipur', 'Tripura', 'Sikkim', 'Goa', 'NCT',
+            'All India', 'Pan India', 'Various', 'Multiple',
+        ]
+        
+        text = f"{title} {description}".lower()
+        
+        for loc in indian_locations:
+            if loc.lower() in text:
+                return loc
+        
+        return ""
+    
+    def _deduplicate_jobs(self, jobs: List[Job]) -> List[Job]:
+        """Remove duplicate jobs based on ID"""
+        seen = set()
+        unique_jobs = []
+        
+        for job in jobs:
+            if job.id not in seen:
+                seen.add(job.id)
+                unique_jobs.append(job)
+        
+        return unique_jobs
+    
+    def get_stats(self) -> dict:
+        """Get scraper statistics including feed results"""
+        stats = self.stats.copy()
+        stats['feed_results'] = self._feed_results
+        return stats
+
+
+# ============================================================================
 # CELL 16: TELEGRAM POSTER
 # ============================================================================
 # Description: Post jobs to Telegram channel
@@ -2854,6 +3170,9 @@ class JobScraperOrchestrator:
         self.superset_scraper = SupersetScraper(
             self.db, self.proxy_manager, self.http_client, self.browser_manager
         )
+        self.govt_scraper = GovernmentJobsScraper(
+            self.db, self.proxy_manager, self.http_client, self.browser_manager
+        )
         
         self._running = False
     
@@ -2931,6 +3250,14 @@ class JobScraperOrchestrator:
                 stats.superset_jobs = superset_stats['found']
                 stats.superset_errors = superset_stats['errors']
             
+            # Scrape Government Jobs
+            if CONFIG['govt']['enabled']:
+                govt_jobs = self.govt_scraper.scrape_all()
+                all_jobs.extend(govt_jobs)
+                govt_stats = self.govt_scraper.get_stats()
+                stats.govt_jobs = govt_stats['found']
+                stats.govt_errors = govt_stats['errors']
+            
             # Save all jobs
             self.logger.info(f"Total jobs found: {len(all_jobs)}")
             for job in all_jobs:
@@ -2943,6 +3270,8 @@ class JobScraperOrchestrator:
                         stats.naukri_new += 1
                     elif job.source == 'superset':
                         stats.superset_new += 1
+                    elif job.source == 'govt':
+                        stats.govt_new += 1
             
             self.logger.info(f"New jobs saved: {stats.total_new}")
             
