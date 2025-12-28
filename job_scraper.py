@@ -2305,13 +2305,13 @@ class NaukriScraper(BaseScraper):
         return all_jobs
     
     def _get_api_headers(self) -> dict:
-        """Get headers for Naukri API"""
+        """Get headers for Naukri API (Updated to bypass 406 Block)"""
         return {
-            'appid': '109',
-            'systemid': 'Naukri',
             'Accept': 'application/json',
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Client-Device': 'desktop',
+            'Accept-Language': 'en-US,en;q=0.9',
         }
     
     def _scrape_via_api(self, keyword: str, location: str) -> List[Job]:
@@ -2361,7 +2361,8 @@ class NaukriScraper(BaseScraper):
                 
             except Exception as e:
                 self.logger.warning(f"Naukri API request failed: {e}")
-                break
+                time.sleep(10)
+                continue
         
         self.logger.info(f"Found {len(jobs)} Naukri jobs for '{keyword}'")
         return jobs
