@@ -173,8 +173,8 @@ PROXY_USE_FREE = False
 PROXY_CUSTOM = []  # Add your paid proxies here: ['http://user:pass@ip:port']
 
 # Scraping Behavior
-SCRAPING_DELAY_MIN = 2.0
-SCRAPING_DELAY_MAX = 6.0
+SCRAPING_DELAY_MIN = 5.0
+SCRAPING_DELAY_MAX = 10.0
 SCRAPING_RANDOMIZE_ORDER = True
 
 # Scheduling
