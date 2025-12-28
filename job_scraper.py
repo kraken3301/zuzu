@@ -379,6 +379,110 @@ CONFIG = {
     },
 }
 
+# ============================================================================
+# IMPORT AND OVERRIDE WITH CONFIG.PY
+# ============================================================================
+# Import config.py if available and override CONFIG dictionary values
+try:
+    import config
+    print("✅ Loading configuration from config.py...")
+    
+    # Override Telegram settings
+    CONFIG['telegram']['bot_token'] = getattr(config, 'TELEGRAM_BOT_TOKEN', CONFIG['telegram']['bot_token'])
+    CONFIG['telegram']['channel_id'] = getattr(config, 'TELEGRAM_CHANNEL_ID', CONFIG['telegram']['channel_id'])
+    
+    # Override LinkedIn settings
+    if hasattr(config, 'LINKEDIN_KEYWORDS'):
+        CONFIG['linkedin']['keywords'] = config.LINKEDIN_KEYWORDS
+    if hasattr(config, 'LINKEDIN_LOCATIONS'):
+        CONFIG['linkedin']['locations'] = config.LINKEDIN_LOCATIONS
+    if hasattr(config, 'LINKEDIN_ENABLED'):
+        CONFIG['linkedin']['enabled'] = config.LINKEDIN_ENABLED
+    if hasattr(config, 'LINKEDIN_USE_LOGIN'):
+        CONFIG['linkedin']['use_login'] = config.LINKEDIN_USE_LOGIN
+    
+    # Override Indeed settings
+    if hasattr(config, 'INDEED_KEYWORDS'):
+        CONFIG['indeed']['keywords'] = config.INDEED_KEYWORDS
+    if hasattr(config, 'INDEED_LOCATIONS'):
+        CONFIG['indeed']['locations'] = config.INDEED_LOCATIONS
+    if hasattr(config, 'INDEED_ENABLED'):
+        CONFIG['indeed']['enabled'] = config.INDEED_ENABLED
+    if hasattr(config, 'INDEED_USE_RSS'):
+        CONFIG['indeed']['use_rss'] = config.INDEED_USE_RSS
+    
+    # Override Naukri settings
+    if hasattr(config, 'NAUKRI_KEYWORDS'):
+        CONFIG['naukri']['keywords'] = config.NAUKRI_KEYWORDS
+    if hasattr(config, 'NAUKRI_LOCATIONS'):
+        CONFIG['naukri']['locations'] = config.NAUKRI_LOCATIONS
+    if hasattr(config, 'NAUKRI_ENABLED'):
+        CONFIG['naukri']['enabled'] = config.NAUKRI_ENABLED
+    if hasattr(config, 'NAUKRI_USE_API'):
+        CONFIG['naukri']['use_api'] = config.NAUKRI_USE_API
+    
+    # Override Superset settings
+    if hasattr(config, 'SUPERSET_ENABLED'):
+        CONFIG['superset']['enabled'] = config.SUPERSET_ENABLED
+    if hasattr(config, 'SUPERSET_EMAIL'):
+        CONFIG['superset']['email'] = config.SUPERSET_EMAIL
+    if hasattr(config, 'SUPERSET_PASSWORD'):
+        CONFIG['superset']['password'] = config.SUPERSET_PASSWORD
+    if hasattr(config, 'SUPERSET_COLLEGE_CODE'):
+        CONFIG['superset']['college_code'] = config.SUPERSET_COLLEGE_CODE
+    
+    # Override Proxy settings
+    if hasattr(config, 'PROXY_ENABLED'):
+        CONFIG['proxy']['enabled'] = config.PROXY_ENABLED
+    if hasattr(config, 'PROXY_USE_FREE'):
+        CONFIG['proxy']['use_free_proxies'] = config.PROXY_USE_FREE
+    if hasattr(config, 'PROXY_CUSTOM'):
+        CONFIG['proxy']['custom_proxies'] = config.PROXY_CUSTOM
+    
+    # Override Filter settings
+    if hasattr(config, 'EXCLUDE_TITLE_KEYWORDS'):
+        CONFIG['filters']['exclude_title_keywords'] = config.EXCLUDE_TITLE_KEYWORDS
+    if hasattr(config, 'EXCLUDE_COMPANIES'):
+        CONFIG['filters']['exclude_companies'] = config.EXCLUDE_COMPANIES
+    if hasattr(config, 'MAX_EXPERIENCE_YEARS'):
+        CONFIG['filters']['max_experience_years'] = config.MAX_EXPERIENCE_YEARS
+    
+    # Override Scraping behavior
+    if hasattr(config, 'SCRAPING_DELAY_MIN'):
+        CONFIG['scraping']['request_delay_min'] = config.SCRAPING_DELAY_MIN
+    if hasattr(config, 'SCRAPING_DELAY_MAX'):
+        CONFIG['scraping']['request_delay_max'] = config.SCRAPING_DELAY_MAX
+    if hasattr(config, 'SCRAPING_RANDOMIZE_ORDER'):
+        CONFIG['scraping']['randomize_order'] = config.SCRAPING_RANDOMIZE_ORDER
+    
+    # Override Schedule settings
+    if hasattr(config, 'RUN_INTERVAL_HOURS'):
+        CONFIG['schedule']['run_interval_hours'] = config.RUN_INTERVAL_HOURS
+    if hasattr(config, 'QUIET_HOURS_START'):
+        CONFIG['schedule']['quiet_hours_start'] = config.QUIET_HOURS_START
+    if hasattr(config, 'QUIET_HOURS_END'):
+        CONFIG['schedule']['quiet_hours_end'] = config.QUIET_HOURS_END
+    
+    # Override Data settings
+    if hasattr(config, 'EXPORT_CSV'):
+        CONFIG['data']['export_csv'] = config.EXPORT_CSV
+    if hasattr(config, 'EXPORT_JSON'):
+        CONFIG['data']['export_json'] = config.EXPORT_JSON
+    if hasattr(config, 'MAX_JOB_AGE_DAYS'):
+        CONFIG['data']['max_age_days'] = config.MAX_JOB_AGE_DAYS
+    
+    print("✅ Configuration loaded from config.py")
+    print(f"   LinkedIn keywords: {len(CONFIG['linkedin']['keywords'])}")
+    print(f"   Indeed keywords: {len(CONFIG['indeed']['keywords'])}")
+    print(f"   Naukri keywords: {len(CONFIG['naukri']['keywords'])}")
+    print(f"   Proxy enabled: {CONFIG['proxy']['enabled']}")
+    
+except ImportError:
+    print("⚠️ config.py not found, using default CONFIG values from job_scraper.py")
+except Exception as e:
+    print(f"⚠️ Error loading config.py: {e}")
+    print("   Using default CONFIG values from job_scraper.py")
+
 def validate_config() -> Tuple[bool, List[str]]:
     """Validate configuration and return (is_valid, errors)"""
     errors = []
@@ -484,9 +588,9 @@ class Job:
         
         lines.extend([
             "",
-            f"🔗 [Apply Now",
+            f"🔗 [Apply Now]({self.url})",
             "",
-            f"#{self.source} #jobs #fresher",
+            f"\\#{self.source} \\#jobs \\#fresher",
         ])
         
         return '\n'.join(lines)
@@ -2614,25 +2718,27 @@ class TelegramPoster:
         try:
             message = job.to_telegram_message()
             
-            # Try Markdown first
+            # Try MarkdownV2 first (required for proper escaping)
             try:
-                result = self.bot.send_message(
+                result = self._run_async(self.bot.send_message(
                     chat_id=CONFIG['telegram']['channel_id'],
                     text=message,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.MARKDOWN_V2,
                     disable_web_page_preview=True
-                )
+                ))
             except:
                 # Fallback to plain text
                 plain_message = self._strip_formatting(message)
-                result = self.bot.send_message(
+                result = self._run_async(self.bot.send_message(
                     chat_id=CONFIG['telegram']['channel_id'],
                     text=plain_message,
                     disable_web_page_preview=True
-                )
+                ))
             
-            self.logger.debug(f"Posted job: {job.title}")
-            return result.message_id
+            if result:
+                self.logger.debug(f"Posted job: {job.title}")
+                return result.message_id
+            return None
             
         except RetryAfter as e:
             self.logger.warning(f"Rate limited, waiting {e.retry_after}s")
@@ -2666,11 +2772,11 @@ class TelegramPoster:
             return
         
         try:
-            self.bot.send_message(
+            self._run_async(self.bot.send_message(
                 chat_id=CONFIG['telegram']['channel_id'],
                 text=stats.get_summary(),
                 parse_mode=ParseMode.MARKDOWN
-            )
+            ))
             self.logger.info("Posted run summary to Telegram")
         except Exception as e:
             self.logger.error(f"Failed to send summary: {e}")
@@ -2683,11 +2789,11 @@ class TelegramPoster:
         chat_id = CONFIG['telegram'].get('admin_chat_id') or CONFIG['telegram']['channel_id']
         
         try:
-            self.bot.send_message(
+            self._run_async(self.bot.send_message(
                 chat_id=chat_id,
                 text=f"⚠️ Scraper Error\n\n{message}",
                 parse_mode=ParseMode.MARKDOWN
-            )
+            ))
         except:
             pass
     
