@@ -21,6 +21,21 @@ from job_scraper import (
 )
 
 
+def _ensure_directories():
+    """Ensure all required directories exist"""
+    required_dirs = [
+        'data',
+        'data/logs',
+        'data/cache', 
+        'data/exports',
+        'data/backups',
+        'data/cookies',
+    ]
+    
+    for dir_path in required_dirs:
+        os.makedirs(dir_path, exist_ok=True)
+
+
 def setup_logging():
     """Initialize the logging system"""
     log_manager = LogManager()
@@ -64,7 +79,10 @@ For Google Colab, run: initialize() and then run() or run_continuous()
     
     args = parser.parse_args()
     
-    # Setup logging first
+    # Create required directories first
+    _ensure_directories()
+    
+    # Setup logging next
     log_manager = setup_logging()
     logger = log_manager.get_logger(__name__)
     
@@ -132,6 +150,7 @@ class InteractiveScraper:
     
     def __init__(self):
         self._orchestrator = None
+        _ensure_directories()
         self._log_manager = setup_logging()
     
     def initialize(self):

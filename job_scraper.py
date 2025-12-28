@@ -795,6 +795,10 @@ class LogManager:
         log_filename = f"{CONFIG['logging']['log_file_prefix']}_{datetime.now().strftime('%Y%m%d')}.log"
         log_filepath = os.path.join(CONFIG['paths']['logs_dir'], log_filename)
         
+        # Ensure log directory exists
+        log_dir = os.path.dirname(log_filepath)
+        os.makedirs(log_dir, exist_ok=True)
+        
         file_handler = logging.FileHandler(log_filepath)
         file_handler.setLevel(getattr(logging, CONFIG['logging']['file_level']))
         file_handler.setFormatter(logging.Formatter(log_format))
@@ -838,6 +842,11 @@ class DatabaseManager:
             CONFIG['paths']['database_dir'],
             CONFIG['data']['database_name']
         )
+        
+        # Ensure database directory exists
+        db_dir = os.path.dirname(self.db_path)
+        os.makedirs(db_dir, exist_ok=True)
+        
         self.logger = LogManager.get_logger('DatabaseManager')
         self._lock = threading.Lock()
         self._init_db()
