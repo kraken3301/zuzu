@@ -150,13 +150,10 @@ SUPERSET_PASSWORD = ""
 SUPERSET_COLLEGE_CODE = ""
 
 # --- GOVERNMENT JOBS RSS CONFIGURATION ---
+# Verified working feeds as of Dec 2024
 GOVT_RSS_FEEDS = [
     'https://www.freejobalert.com/feed',
-    'https://www.sarkariresultadda.com/feed',
-    'https://sarkariexamresult.com/feed',
-    'https://www.govtjobsind.com/feed',
-    'https://www.sarkariexams.com/feed',
-    'https://www.jobhunts.in/feed',
+    'https://www.rojgarresult.com/feed/',
 ]
 
 # Government Jobs Scraping Settings
@@ -167,16 +164,11 @@ GOVT_ENABLED = True         # Enable/disable government jobs scraping
 # Government Job Feed Optimization - Primary (fast, high-quality)
 GOVT_FEEDS_PRIMARY = [
     'https://www.freejobalert.com/feed',
-    'https://www.sarkariexams.com/feed',
+    'https://www.rojgarresult.com/feed/',
 ]
 
 # Government Job Feed Optimization - Secondary (backup feeds)
-GOVT_FEEDS_SECONDARY = [
-    'https://www.sarkariresultadda.com/feed',
-    'https://sarkariexamresult.com/feed',
-    'https://www.govtjobsind.com/feed',
-    'https://www.jobhunts.in/feed',
-]
+GOVT_FEEDS_SECONDARY = []  # No secondary feeds currently - add more as they become available
 
 # Government Feed Advanced Settings
 GOVT_FEED_PARALLEL = True           # Enable parallel feed fetching

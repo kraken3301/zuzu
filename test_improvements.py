@@ -90,6 +90,8 @@ def test_govt_improvements():
         # Test feed name extraction
         feed_name = scraper._get_feed_name('https://www.freejobalert.com/feed')
         assert feed_name == "FreeJobAlert", f"Unexpected feed name: {feed_name}"
+        feed_name2 = scraper._get_feed_name('https://www.rojgarresult.com/feed/')
+        assert feed_name2 == "RojgarResult", f"Unexpected feed name: {feed_name2}"
         print(f"   ✅ Feed name extraction working")
         
         # Test config loading
