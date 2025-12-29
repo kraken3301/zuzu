@@ -280,11 +280,7 @@ CONFIG = {
         'enabled': True,
         'rss_feeds': [
             'https://www.freejobalert.com/feed',
-            'https://www.sarkariresultadda.com/feed',
-            'https://sarkariexamresult.com/feed',
-            'https://www.govtjobsind.com/feed',
-            'https://www.sarkariexams.com/feed',
-            'https://www.jobhunts.in/feed',
+            'https://www.rojgarresult.com/feed/',
         ],
         'timeout': 10,                        # seconds per feed request
         'max_retries': 3,                     # retry attempts per failed feed
@@ -3278,6 +3274,14 @@ class GovernmentJobsScraper(BaseScraper):
         """Extract readable feed name from URL"""
         if 'freejobalert' in feed_url:
             return "FreeJobAlert"
+        elif 'rojgarresult' in feed_url:
+            return "RojgarResult"
+        elif 'sarkariresult.com' in feed_url:
+            return "SarkariResult"
+        elif 'freshersworld' in feed_url:
+            return "FreshersWorld"
+        elif 'employmentnews' in feed_url:
+            return "EmploymentNews"
         elif 'sarkariexams' in feed_url:
             return "SarkariExams"
         elif 'sarkariresultadda' in feed_url:
