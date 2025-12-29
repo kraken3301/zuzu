@@ -337,6 +337,16 @@ CONFIG = {
         'concurrent_scrapers': 1,             # Keep 1 to avoid blocks
         'randomize_order': True,              # Randomize keyword/location order
     },
+
+    # =========================================================================
+    # EARLY EXIT (FAIL-FAST) SETTINGS
+    # =========================================================================
+    'early_exit': {
+        'enabled': True,
+        'zero_results_threshold': 5,          # Successful location checks before skipping
+        'error_threshold': 3,                 # Consecutive errors before skipping
+        'notify_telegram': True,              # Send Telegram alerts when a scraper is skipped
+    },
     
     # =========================================================================
     # DATA & STORAGE
@@ -522,6 +532,18 @@ try:
         CONFIG['govt']['max_retries'] = config.GOVT_SCRAPING_RETRIES
     if hasattr(config, 'USER_AGENT'):
         CONFIG['govt']['user_agent'] = config.USER_AGENT
+
+    # Override Early Exit settings (optional)
+    if hasattr(config, 'EARLY_EXIT') and isinstance(getattr(config, 'EARLY_EXIT'), dict):
+        CONFIG['early_exit'].update(config.EARLY_EXIT)
+    if hasattr(config, 'EARLY_EXIT_ENABLED'):
+        CONFIG['early_exit']['enabled'] = config.EARLY_EXIT_ENABLED
+    if hasattr(config, 'EARLY_EXIT_ZERO_RESULTS_THRESHOLD'):
+        CONFIG['early_exit']['zero_results_threshold'] = config.EARLY_EXIT_ZERO_RESULTS_THRESHOLD
+    if hasattr(config, 'EARLY_EXIT_ERROR_THRESHOLD'):
+        CONFIG['early_exit']['error_threshold'] = config.EARLY_EXIT_ERROR_THRESHOLD
+    if hasattr(config, 'EARLY_EXIT_NOTIFY_TELEGRAM'):
+        CONFIG['early_exit']['notify_telegram'] = config.EARLY_EXIT_NOTIFY_TELEGRAM
     
     print("✅ Configuration loaded from config.py")
     print(f"   LinkedIn keywords: {len(CONFIG['linkedin']['keywords'])}")
@@ -1807,12 +1829,14 @@ class BaseScraper(ABC):
         db: DatabaseManager,
         proxy_manager: ProxyManager,
         http_client: HTTPClient,
-        browser_manager: BrowserManager
+        browser_manager: BrowserManager,
+        telegram_poster=None,
     ):
         self.db = db
         self.proxy_manager = proxy_manager
         self.http = http_client
         self.browser = browser_manager
+        self.telegram = telegram_poster
         self.logger = LogManager.get_logger(self.__class__.__name__)
         self.stats = {'found': 0, 'new': 0, 'errors': 0}
     
@@ -2131,35 +2155,81 @@ class IndeedScraper(BaseScraper):
     RSS_URL = "https://www.indeed.com/rss"
     
     def scrape_all(self) -> List[Job]:
-        """Scrape all configured Indeed searches"""
+        """Scrape all configured Indeed searches (with fail-fast early-exit logic)"""
         if not CONFIG['indeed']['enabled']:
             self.logger.info("Indeed scraper disabled")
             return []
-        
-        all_jobs = []
-        keywords = CONFIG['indeed']['keywords']
-        locations = CONFIG['indeed']['locations']
-        
+
+        early_cfg = CONFIG.get('early_exit', {})
+        early_enabled = bool(early_cfg.get('enabled', False))
+        zero_threshold = int(early_cfg.get('zero_results_threshold', 5) or 5)
+        error_threshold = int(early_cfg.get('error_threshold', 3) or 3)
+
+        all_jobs: List[Job] = []
+        keywords = list(CONFIG['indeed']['keywords'])
+        locations = list(CONFIG['indeed']['locations'])
+
         if CONFIG['scraping']['randomize_order']:
             random.shuffle(keywords)
             random.shuffle(locations)
-        
+
+        successful_location_checks = 0
+        total_jobs_found = 0
+        consecutive_errors = 0
+        aborted = False
+
         for keyword in keywords:
+            if aborted:
+                break
+
             for location in locations:
                 try:
                     self.logger.info(f"Scraping Indeed: '{keyword}' in '{location}'")
-                    
+
                     if CONFIG['indeed']['use_rss']:
                         jobs = self._scrape_via_rss(keyword, location)
                     else:
                         jobs = self._scrape_via_web(keyword, location)
-                    
+
+                    consecutive_errors = 0
+                    successful_location_checks += 1
+                    total_jobs_found += len(jobs)
+
                     all_jobs.extend(jobs)
                     self.stats['found'] += len(jobs)
+
+                    # Fail-fast: if we have checked N locations and still have zero jobs, stop.
+                    if early_enabled and total_jobs_found == 0 and successful_location_checks >= zero_threshold:
+                        self.logger.warning(
+                            f"⚠️ No Indeed jobs found after checking {successful_location_checks} locations, skipping remaining locations/keywords"
+                        )
+                        if self.telegram:
+                            self.telegram.send_scraper_alert(
+                                'Indeed',
+                                f"No jobs found for '{keyword}' after checking {successful_location_checks} locations - skipping to other sources",
+                                severity='error',
+                            )
+                        aborted = True
+                        break
+
                 except Exception as e:
-                    self.logger.error(f"Indeed scrape error: {e}")
+                    consecutive_errors += 1
                     self.stats['errors'] += 1
-        
+                    self.logger.error(f"❌ Indeed scrape error ({type(e).__name__}): {e}")
+
+                    if early_enabled and consecutive_errors >= error_threshold:
+                        self.logger.error(
+                            f"❌ Indeed returning persistent errors ({consecutive_errors} consecutive) - exiting scraper"
+                        )
+                        if self.telegram:
+                            self.telegram.send_scraper_alert(
+                                'Indeed',
+                                f"Persistent errors ({type(e).__name__}) - skipping to other sources",
+                                severity='warning',
+                            )
+                        aborted = True
+                        break
+
         return all_jobs
     
     def _scrape_via_rss(self, keyword: str, location: str) -> List[Job]:
@@ -2310,36 +2380,83 @@ class NaukriScraper(BaseScraper):
             self.session.headers.update({'User-Agent': self._get_random_user_agent()})
     
     def scrape_all(self) -> List[Job]:
-        """Scrape all configured Naukri searches"""
+        """Scrape all configured Naukri searches (with fail-fast early-exit logic)"""
         if not CONFIG['naukri']['enabled']:
             self.logger.info("Naukri scraper disabled")
             return []
-        
-        all_jobs = []
-        keywords = CONFIG['naukri']['keywords']
-        locations = CONFIG['naukri']['locations']
-        
+
+        early_cfg = CONFIG.get('early_exit', {})
+        early_enabled = bool(early_cfg.get('enabled', False))
+        zero_threshold = int(early_cfg.get('zero_results_threshold', 5) or 5)
+        error_threshold = int(early_cfg.get('error_threshold', 3) or 3)
+
+        all_jobs: List[Job] = []
+        keywords = list(CONFIG['naukri']['keywords'])
+        locations = list(CONFIG['naukri']['locations'])
+
         if CONFIG['scraping']['randomize_order']:
             random.shuffle(keywords)
             random.shuffle(locations)
-        
+
+        successful_location_checks = 0
+        total_jobs_found = 0
+        consecutive_errors = 0
+        aborted = False
+
         for keyword in keywords:
+            if aborted:
+                break
+
             for location in locations:
                 try:
                     self.logger.info(f"📡 Naukri Request: {keyword} in {location}")
-                    
+
                     if CONFIG['naukri']['use_api']:
                         jobs = self._scrape_via_api(keyword, location)
                     else:
                         jobs = self._scrape_via_selenium(keyword, location)
-                    
+
+                    consecutive_errors = 0
+                    successful_location_checks += 1
+                    total_jobs_found += len(jobs)
+
                     all_jobs.extend(jobs)
                     self.stats['found'] += len(jobs)
                     self.logger.info(f"   ✅ Found {len(jobs)} Naukri jobs for '{keyword}' in '{location}'")
+
+                    if early_enabled and total_jobs_found == 0 and successful_location_checks >= zero_threshold:
+                        self.logger.warning(
+                            f"⚠️ No Naukri jobs found after checking {successful_location_checks} locations, skipping remaining locations/keywords"
+                        )
+                        if self.telegram:
+                            self.telegram.send_scraper_alert(
+                                'Naukri',
+                                f"No jobs found for '{keyword}' after checking {successful_location_checks} locations - skipping to other sources",
+                                severity='error',
+                            )
+                        aborted = True
+                        break
+
                 except Exception as e:
-                    self.logger.error(f"   ❌ Naukri scrape error: {e}")
+                    consecutive_errors += 1
                     self.stats['errors'] += 1
-        
+
+                    details = self._summarize_exception(e)
+                    self.logger.error(f"   ❌ Naukri scrape error ({consecutive_errors} consecutive): {details}")
+
+                    if early_enabled and consecutive_errors >= error_threshold:
+                        self.logger.error(
+                            f"❌ Naukri API returning persistent errors ({consecutive_errors} consecutive) - exiting scraper"
+                        )
+                        if self.telegram:
+                            self.telegram.send_scraper_alert(
+                                'Naukri',
+                                f"API unavailable ({details}) - will retry later",
+                                severity='warning',
+                            )
+                        aborted = True
+                        break
+
         return all_jobs
     
     def _get_random_user_agent(self) -> str:
@@ -2381,56 +2498,133 @@ class NaukriScraper(BaseScraper):
         
         return headers
 
+    def _sanitize_dict(self, data: dict) -> dict:
+        """Return a sanitized copy of a dict to avoid leaking secrets in logs."""
+        if not isinstance(data, dict):
+            return {}
+
+        redacted_tokens = ('token', 'auth', 'authorization', 'cookie', 'password', 'secret', 'key')
+        safe: dict = {}
+        for k, v in data.items():
+            key = str(k)
+            if any(t in key.lower() for t in redacted_tokens):
+                safe[key] = '***'
+            else:
+                safe_val = v
+                if isinstance(v, str) and len(v) > 200:
+                    safe_val = v[:200] + '…'
+                safe[key] = safe_val
+        return safe
+
+    def _sanitize_headers(self, headers: dict) -> dict:
+        if not isinstance(headers, dict):
+            return {}
+        deny = {'authorization', 'cookie', 'set-cookie'}
+        return {k: v for k, v in headers.items() if str(k).lower() not in deny}
+
+    def _get_interesting_response_headers(self, headers: dict) -> dict:
+        """Return response headers that often indicate blocking/rate limiting/WAF."""
+        if not isinstance(headers, dict):
+            return {}
+
+        patterns = [
+            'retry-after',
+            'rate',
+            'cf-',
+            'cloudflare',
+            'akamai',
+            'incap',
+            'sucuri',
+            'waf',
+            'x-amzn',
+            'x-cache',
+            'server',
+            'via',
+        ]
+        deny = {'set-cookie', 'cookie', 'authorization'}
+
+        out = {}
+        for k, v in headers.items():
+            lk = str(k).lower()
+            if lk in deny:
+                continue
+            if lk in {'content-type', 'content-length'} or any(p in lk for p in patterns):
+                out[k] = v
+        return out
+
+    def _summarize_exception(self, exc: Exception) -> str:
+        """Short, human readable error summary for logs/Telegram."""
+        if isinstance(exc, requests.exceptions.Timeout):
+            return 'Timeout'
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            return 'ConnectionError'
+        if isinstance(exc, requests.exceptions.HTTPError):
+            resp = getattr(exc, 'response', None)
+            if resp is not None:
+                return f"{resp.status_code} {resp.reason}"
+            return 'HTTPError'
+        return f"{type(exc).__name__}: {str(exc)[:120]}"
+
     def _log_request_details(self, url: str, method: str, params: dict, headers: dict):
-        """Log detailed request information for debugging"""
-        if CONFIG['naukri'].get('log_level', 'DEBUG') != 'DEBUG':
+        """Log detailed request information for debugging (sanitized)."""
+        if CONFIG['naukri'].get('log_level', 'DEBUG') != 'DEBUG' and not self.logger.isEnabledFor(logging.DEBUG):
             return
-            
-        # Mask sensitive data in headers if any
-        safe_headers = {k: v for k, v in headers.items() if k.lower() not in ['authorization', 'cookie']}
-        
-        self.logger.debug(f"   [REQUEST] {method} {url}")
-        self.logger.debug(f"   [PARAMS] {params}")
+
+        attempt = getattr(self, '_naukri_retry_attempt', 1)
+        max_attempts = int(CONFIG['naukri'].get('max_retries', 3) or 3)
+
+        safe_headers = self._sanitize_headers(headers)
+        safe_params = self._sanitize_dict(params)
+
+        self.logger.debug(f"   [NAUKRI REQUEST] Attempt {attempt}/{max_attempts} | {method} {url}")
+        self.logger.debug(f"   [PARAMS] {safe_params}")
         self.logger.debug(f"   [HEADERS] {safe_headers}")
 
     def _log_response_details(self, response: requests.Response, start_time: float):
-        """Log detailed response information for debugging"""
+        """Log detailed response information for debugging."""
         duration = time.time() - start_time
-        log_level = CONFIG['naukri'].get('log_level', 'DEBUG')
-        
+        status_line = f"{response.status_code} {response.reason}".strip()
+
         if response.ok:
-            self.logger.debug(f"   [RESPONSE] Status: {response.status_code} {response.reason} | Time: {duration:.2f}s")
-        else:
-            self.logger.warning(f"   [RESPONSE] Status: {response.status_code} {response.reason} | Time: {duration:.2f}s")
-        
-        if log_level == 'DEBUG':
-            # Log interesting headers
-            rate_limit_headers = {k: v for k, v in response.headers.items() 
-                                  if any(x in k.lower() for x in ['rate-limit', 'retry-after', 'x-naukri', 'cloudflare', 'server'])}
-            if rate_limit_headers:
-                self.logger.debug(f"   [HEADERS] {rate_limit_headers}")
-                
-            if not response.ok or CONFIG['naukri'].get('log_body', False):
-                # Log preview of response body on error
-                try:
-                    preview = response.text[:500]
-                    self.logger.debug(f"   [BODY PREVIEW] {preview}")
-                except Exception as e:
-                    self.logger.debug(f"   [BODY PREVIEW ERROR] Could not read body: {e}")
+            self.logger.debug(f"   [NAUKRI RESPONSE] {status_line} | {duration:.2f}s | {response.url}")
+            return
+
+        self.logger.warning(f"   [NAUKRI RESPONSE] {status_line} | {duration:.2f}s | {response.url}")
+
+        interesting = self._get_interesting_response_headers(dict(response.headers))
+        if interesting:
+            self.logger.warning(f"   [NAUKRI HEADERS] {interesting}")
+
+        if CONFIG['naukri'].get('log_level', 'DEBUG') == 'DEBUG' or CONFIG['naukri'].get('log_body', False):
+            try:
+                preview = (response.text or '')[:500]
+                if preview:
+                    self.logger.debug(f"   [NAUKRI BODY PREVIEW] {preview}")
+            except Exception as e:
+                self.logger.debug(f"   [NAUKRI BODY PREVIEW ERROR] {e}")
+
+    @staticmethod
+    def _before_attempt(retry_state):
+        """Track attempt number for request/response logging."""
+        self = retry_state.args[0]
+        self._naukri_retry_attempt = retry_state.attempt_number
 
     @staticmethod
     def _before_retry_log(retry_state):
-        """Log before each retry attempt"""
+        """Log before sleeping between retry attempts."""
         self = retry_state.args[0]
         attempt = retry_state.attempt_number
-        
+        max_attempts = int(CONFIG['naukri'].get('max_retries', 3) or 3)
+
         if retry_state.outcome.failed:
             exc = retry_state.outcome.exception()
-            self.logger.warning(f"   ⚠️ Attempt {attempt} failed: {type(exc).__name__}: {str(exc)[:100]}")
-        
-        if hasattr(retry_state, 'next_action') and retry_state.next_action:
+            summary = self._summarize_exception(exc)
+            self.logger.warning(f"   ⚠️ Naukri attempt {attempt}/{max_attempts} failed: {summary}")
+
+        if getattr(retry_state, 'next_action', None):
             wait_time = retry_state.next_action.sleep
-            self.logger.info(f"   🔄 Retry {attempt} scheduled in {wait_time:.1f}s...")
+            next_attempt = min(attempt + 1, max_attempts)
+            self.logger.info(f"   🔄 Retrying in {wait_time:.1f}s (next attempt {next_attempt}/{max_attempts})")
 
     def _smart_delay(self, min_delay: float = 5.0, max_delay: float = 10.0):
         """Randomized delay to simulate human browsing"""
@@ -2448,69 +2642,84 @@ class NaukriScraper(BaseScraper):
         stop=stop_after_attempt(CONFIG['naukri'].get('max_retries', 3)),
         wait=wait_exponential(multiplier=CONFIG['naukri'].get('retry_backoff', 2), min=2, max=30),
         retry=retry_if_exception_type((requests.RequestException, ConnectionError, requests.HTTPError)),
-        before_sleep=_before_retry_log
+        before=_before_attempt,
+        before_sleep=_before_retry_log,
+        reraise=True,
     )
     def _make_api_request_with_retry(self, url: str, params: dict, headers: dict) -> requests.Response:
-        """Make API request with automatic exponential backoff and detailed logging"""
-        # Use session if available, otherwise use requests
+        """Make API request with automatic exponential backoff and detailed logging."""
         http_client = self.session if self.session else requests
+
+        attempt = getattr(self, '_naukri_retry_attempt', 1)
+        max_attempts = int(CONFIG['naukri'].get('max_retries', 3) or 3)
+        timeout_s = CONFIG['naukri'].get('timeout', 15)
+
         start_time = time.time()
-        
-        # Log request details
         self._log_request_details(url, "GET", params, headers)
-        
+
         try:
             response = http_client.get(
-                url, 
-                params=params, 
-                headers=headers, 
-                timeout=CONFIG['naukri'].get('timeout', 15)
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout_s,
             )
-            
-            # Log response details
-            self._log_response_details(response, start_time)
-            
-            # Handle specific error codes
-            if response.status_code == 406:
-                # 406: Not Acceptable - Rotate UA and retry
-                self.logger.warning(f"   ⚠️ 406 Not Acceptable detected, rotating User-Agent...")
-                headers['User-Agent'] = self._get_random_user_agent()
-                raise requests.HTTPError(f"406 Not Acceptable: {response.reason}", response=response)
-            
-            elif response.status_code == 429:
-                # 429: Too Many Requests - Wait longer
-                self.logger.warning(f"   ⚠️ 429 Rate limit detected, waiting 30s...")
-                time.sleep(30)
-                raise requests.HTTPError(f"429 Too Many Requests: {response.reason}", response=response)
-            
-            elif response.status_code >= 500:
-                # 500+: Server error - Will be handled by @retry decorator
-                self.logger.warning(f"   ⚠️ Server error {response.status_code} {response.reason}")
-                raise requests.HTTPError(f"{response.status_code} Server Error: {response.reason}", response=response)
-            
-            response.raise_for_status()
-            return response
-            
         except requests.exceptions.Timeout as e:
-            self.logger.error(f"   ⏱️ Request timeout occurred: {type(e).__name__}")
+            duration = time.time() - start_time
+            self.logger.error(f"   ⏱️ Timeout after {duration:.2f}s (attempt {attempt}/{max_attempts})")
             raise
         except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"   🌐 Connection error occurred: {type(e).__name__}")
-            raise
-        except requests.exceptions.HTTPError:
-            # Already logged above
+            duration = time.time() - start_time
+            self.logger.error(f"   🌐 ConnectionError after {duration:.2f}s (attempt {attempt}/{max_attempts}): {e}")
             raise
         except requests.RequestException as e:
-            self.logger.error(f"   ❌ Request failed: {type(e).__name__}: {e}")
+            duration = time.time() - start_time
+            self.logger.error(f"   ❌ RequestException after {duration:.2f}s (attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}")
             raise
+
+        self._log_response_details(response, start_time)
+
+        # Handle specific error codes with richer logs
+        if response.status_code == 406:
+            self.logger.warning("   ⚠️ 406 Not Acceptable detected (likely blocked) - rotating User-Agent")
+            headers['User-Agent'] = self._get_random_user_agent()
+            raise requests.HTTPError(f"406 Not Acceptable: {response.reason}", response=response)
+
+        if response.status_code == 429:
+            retry_after_raw = response.headers.get('Retry-After')
+            try:
+                retry_after = int(retry_after_raw) if retry_after_raw else 30
+            except ValueError:
+                retry_after = 30
+
+            self.logger.warning(f"   ⚠️ 429 Too Many Requests (Retry-After: {retry_after}s)")
+            time.sleep(min(max(retry_after, 1), 120))
+            raise requests.HTTPError(f"429 Too Many Requests: {response.reason}", response=response)
+
+        if response.status_code in (401, 403):
+            self.logger.warning(f"   ⚠️ {response.status_code} {response.reason} (possible WAF/blocking)")
+
+        if response.status_code >= 500:
+            self.logger.warning(f"   ⚠️ Server error {response.status_code} {response.reason}")
+            raise requests.HTTPError(f"{response.status_code} Server Error: {response.reason}", response=response)
+
+        # For all remaining 4xx/5xx, let requests raise a proper HTTPError with response attached.
+        response.raise_for_status()
+        return response
     
     def _scrape_via_api(self, keyword: str, location: str) -> List[Job]:
-        """Scrape using mobile API with professional-grade reliability"""
-        jobs = []
+        """Scrape using the Naukri job search API.
+
+        Notes:
+        - Network/HTTP failures are retried inside _make_api_request_with_retry().
+        - If page 1 fails after retries, we raise to let scrape_all() apply fail-fast logic.
+        - If a later page fails, we keep already collected jobs and stop paging for this location.
+        """
+        jobs: List[Job] = []
         max_pages = CONFIG['naukri'].get('max_pages_per_search', 5)
-        
+
         self.logger.info(f"   🔍 Starting API scrape for '{keyword}' in '{location}' (Up to {max_pages} pages)")
-        
+
         for page in range(1, max_pages + 1):
             page_start_time = time.time()
             try:
@@ -2524,21 +2733,26 @@ class NaukriScraper(BaseScraper):
                     'freshness': CONFIG['naukri']['freshness'],
                     'pageNo': page,
                 }
-                
-                # Get fresh headers with rotated UA
+
                 headers = self._get_api_headers()
-                
-                # Make request with retry logic
+
                 self.logger.info(f"   📄 Scraping page {page}/{max_pages}...")
                 response = self._make_api_request_with_retry(self.API_URL, params, headers)
-                
-                data = response.json()
+
+                try:
+                    data = response.json()
+                except Exception as e:
+                    self.stats['errors'] += 1
+                    self.logger.error(f"   ❌ Failed to decode Naukri JSON (page {page}): {type(e).__name__}: {e}")
+                    if page == 1 and not jobs:
+                        raise
+                    break
+
                 job_list = data.get('jobDetails', [])
-                
                 if not job_list:
                     self.logger.info(f"   ⏹️ No more jobs found on page {page}")
                     break
-                
+
                 page_jobs_count = 0
                 for job_data in job_list:
                     try:
@@ -2548,21 +2762,30 @@ class NaukriScraper(BaseScraper):
                             page_jobs_count += 1
                     except Exception as e:
                         self.logger.debug(f"Failed to parse API response: {e}")
-                
+
                 duration = time.time() - page_start_time
-                self.logger.info(f"   ✅ Page {page} processed: Found {len(job_list)} jobs, {page_jobs_count} matched filters ({duration:.1f}s)")
-                
-                # Smart delay between pages
+                self.logger.info(
+                    f"   ✅ Page {page} processed: Found {len(job_list)} jobs, {page_jobs_count} matched filters ({duration:.1f}s)"
+                )
+
                 if page < max_pages:
-                    self._smart_delay(min_delay=CONFIG['scraping']['delay_min'], 
-                                    max_delay=CONFIG['scraping']['delay_max'])
-                
+                    self._smart_delay(
+                        min_delay=CONFIG['scraping']['delay_min'],
+                        max_delay=CONFIG['scraping']['delay_max'],
+                    )
+
             except Exception as e:
-                self.logger.error(f"   ❌ Naukri API request failed on page {page} after retries: {type(e).__name__}: {e}")
                 self.stats['errors'] += 1
-                # Don't break, try next page
-                continue
-        
+                summary = self._summarize_exception(e)
+                self.logger.error(f"   ❌ Naukri API request failed on page {page} after retries: {summary}")
+
+                # Let the caller decide whether to abort the whole scraper.
+                if page == 1 and not jobs:
+                    raise
+
+                # Don't waste time on remaining pages if paging is unstable.
+                break
+
         return jobs
     
     def _parse_api_response(self, data: dict, keyword: str) -> Optional[Job]:
@@ -3457,6 +3680,35 @@ class TelegramPoster:
             ))
         except:
             pass
+
+    def send_scraper_alert(self, scraper_name: str, reason: str, severity: str = 'warning'):
+        """Send a scraper health/skip notification.
+
+        severity: 'warning' or 'error'
+        """
+        if not CONFIG['telegram']['enabled'] or not self.bot:
+            return
+
+        if not CONFIG.get('early_exit', {}).get('notify_telegram', True):
+            return
+
+        chat_id = CONFIG['telegram'].get('admin_chat_id') or CONFIG['telegram']['channel_id']
+
+        emoji = '⚠️' if severity == 'warning' else '❌'
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Using Markdown (not MarkdownV2) to avoid aggressive escaping for plain alerts
+        text = f"{emoji} *{scraper_name} Scraper*: {reason}\n`{ts}`"
+
+        try:
+            self._run_async(self.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            ))
+        except Exception as e:
+            self.logger.debug(f"Failed to send scraper alert: {e}")
     
     def _is_quiet_hours(self) -> bool:
         """Check if currently in quiet hours"""
@@ -3504,19 +3756,39 @@ class JobScraperOrchestrator:
         
         # Initialize scrapers
         self.linkedin_scraper = LinkedInScraper(
-            self.db, self.proxy_manager, self.http_client, self.browser_manager
+            self.db,
+            self.proxy_manager,
+            self.http_client,
+            self.browser_manager,
+            telegram_poster=self.telegram,
         )
         self.indeed_scraper = IndeedScraper(
-            self.db, self.proxy_manager, self.http_client, self.browser_manager
+            self.db,
+            self.proxy_manager,
+            self.http_client,
+            self.browser_manager,
+            telegram_poster=self.telegram,
         )
         self.naukri_scraper = NaukriScraper(
-            self.db, self.proxy_manager, self.http_client, self.browser_manager
+            self.db,
+            self.proxy_manager,
+            self.http_client,
+            self.browser_manager,
+            telegram_poster=self.telegram,
         )
         self.superset_scraper = SupersetScraper(
-            self.db, self.proxy_manager, self.http_client, self.browser_manager
+            self.db,
+            self.proxy_manager,
+            self.http_client,
+            self.browser_manager,
+            telegram_poster=self.telegram,
         )
         self.govt_scraper = GovernmentJobsScraper(
-            self.db, self.proxy_manager, self.http_client, self.browser_manager
+            self.db,
+            self.proxy_manager,
+            self.http_client,
+            self.browser_manager,
+            telegram_poster=self.telegram,
         )
         
         self._running = False
@@ -3786,6 +4058,171 @@ def test_superset():
     jobs = orchestrator.superset_scraper.scrape_all()
     print(f"Found {len(jobs)} Superset jobs")
     return jobs
+
+
+def initialize_gov_scraper():
+    """Initialize GovernmentJobsScraper and validate feed connectivity."""
+    if not orchestrator:
+        initialize()
+
+    scraper = orchestrator.govt_scraper
+    scraper.logger.info("🏛 Initializing Government Jobs Scraper...")
+
+    report = test_gov_scraper_feeds()
+    up = sum(1 for r in report.values() if r.get('ok'))
+    total = len(report)
+
+    if up == 0:
+        scraper.logger.error("❌ Government feeds not reachable")
+    elif up < total:
+        scraper.logger.warning(f"⚠️ Government feeds partially reachable ({up}/{total})")
+    else:
+        scraper.logger.info(f"✅ Government feeds reachable ({up}/{total})")
+
+    return scraper
+
+
+def test_gov_scraper_feeds(timeout: int = 5):
+    """Test Government RSS feed availability and response times.
+
+    Returns a dict keyed by feed_url with ok/status/elapsed/error fields.
+    """
+    if not orchestrator:
+        initialize()
+
+    scraper = orchestrator.govt_scraper
+
+    # Prefer optimized feed lists if present in config.py
+    try:
+        import config as user_config
+
+        primary = getattr(user_config, 'GOVT_FEEDS_PRIMARY', None) or []
+        secondary = getattr(user_config, 'GOVT_FEEDS_SECONDARY', None) or []
+        feeds = list(dict.fromkeys(list(primary) + list(secondary)))  # preserve order, dedupe
+        if not feeds:
+            feeds = list(CONFIG['govt']['rss_feeds'])
+    except Exception:
+        feeds = list(CONFIG['govt']['rss_feeds'])
+
+    headers = {
+        'User-Agent': CONFIG['govt']['user_agent'],
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+
+    scraper.logger.info(f"🧪 Testing {len(feeds)} government RSS feeds (timeout={timeout}s)")
+
+    results: Dict[str, dict] = {}
+
+    def _check_feed(feed_url: str) -> Tuple[str, dict]:
+        start = time.time()
+        try:
+            resp = requests.get(feed_url, headers=headers, timeout=timeout)
+            elapsed = time.time() - start
+            ok = 200 <= resp.status_code < 400
+            return feed_url, {
+                'ok': ok,
+                'status': resp.status_code,
+                'elapsed': elapsed,
+            }
+        except Exception as e:
+            elapsed = time.time() - start
+            return feed_url, {
+                'ok': False,
+                'status': None,
+                'elapsed': elapsed,
+                'error': f"{type(e).__name__}: {str(e)[:120]}",
+            }
+
+    # Parallelize to keep test under ~30s even if several feeds are slow/down
+    from concurrent.futures import as_completed
+
+    max_workers = min(3, max(1, len(feeds)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_check_feed, url): url for url in feeds}
+        for future in as_completed(future_map):
+            feed_url, result = future.result()
+            results[feed_url] = result
+
+            if result.get('ok'):
+                scraper.logger.info(
+                    f"✅ {scraper._get_feed_name(feed_url)}: {result.get('status')} ({result.get('elapsed', 0):.1f}s)"
+                )
+            else:
+                status = result.get('status')
+                elapsed = result.get('elapsed', 0)
+                error = result.get('error')
+                if status is not None:
+                    scraper.logger.warning(f"⚠️ {scraper._get_feed_name(feed_url)}: {status} ({elapsed:.1f}s)")
+                else:
+                    scraper.logger.error(f"❌ {scraper._get_feed_name(feed_url)}: {error} ({elapsed:.1f}s)")
+
+    return results
+
+
+def test_government_jobs():
+    """Quick government jobs scrape using 1-2 popular feeds.
+
+    Keeps runtime low for fast debugging.
+    """
+    if not orchestrator:
+        initialize()
+
+    scraper = orchestrator.govt_scraper
+
+    # Use primary feeds when available, otherwise fall back to first 2 configured feeds
+    try:
+        import config as user_config
+
+        feeds = getattr(user_config, 'GOVT_FEEDS_PRIMARY', None) or []
+        feeds = list(feeds)[:2] if feeds else list(CONFIG['govt']['rss_feeds'])[:2]
+    except Exception:
+        feeds = list(CONFIG['govt']['rss_feeds'])[:2]
+
+    # Temporarily tune for fast testing
+    old_timeout = CONFIG['govt']['timeout']
+    old_retries = CONFIG['govt']['max_retries']
+    old_max_jobs = CONFIG['govt']['max_jobs_per_feed']
+
+    CONFIG['govt']['timeout'] = min(old_timeout, 5)
+    CONFIG['govt']['max_retries'] = 1
+    CONFIG['govt']['max_jobs_per_feed'] = min(old_max_jobs, 10)
+
+    try:
+        scraper.logger.info(f"🏛 Quick scrape on feeds: {feeds}")
+
+        jobs: List[Job] = []
+        for feed_url in feeds:
+            jobs.extend(scraper._scrape_feed_with_retry(feed_url, max_retries=1))
+
+        unique_jobs = scraper._deduplicate_jobs(jobs)
+        valid_jobs = [j for j in unique_jobs if scraper.validate_job(j)]
+
+        scraper.logger.info(f"✅ Government jobs fetched: {len(unique_jobs)} unique ({len(valid_jobs)} valid)")
+
+        # Print a small sample for readability
+        sample = valid_jobs[:5]
+        if sample:
+            print("\n🏛 SAMPLE GOVERNMENT JOBS")
+            print("=" * 60)
+            for job in sample:
+                print(f"\n🔹 {job.title}")
+                print(f"   🏢 {job.company} | 📍 {job.location}")
+                print(f"   🔗 {job.url}")
+        else:
+            scraper.logger.warning("⚠️ No sample jobs to display")
+
+        return valid_jobs
+
+    except Exception as e:
+        scraper.logger.error(f"❌ Government jobs test failed: {type(e).__name__}: {e}")
+        return []
+
+    finally:
+        CONFIG['govt']['timeout'] = old_timeout
+        CONFIG['govt']['max_retries'] = old_retries
+        CONFIG['govt']['max_jobs_per_feed'] = old_max_jobs
+
 
 def test_telegram():
     """Send test message to Telegram"""
