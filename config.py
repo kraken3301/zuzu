@@ -193,6 +193,8 @@ NAUKRI_RETRY_ATTEMPTS = 3            # Exponential backoff retries
 NAUKRI_RETRY_BACKOFF = 2             # Exponential multiplier
 NAUKRI_SMART_DELAYS = True           # Random delays with occasional longer pauses
 NAUKRI_MAX_TIMEOUT = 15              # Request timeout in seconds
+NAUKRI_LOG_LEVEL = 'DEBUG'           # DEBUG or INFO for request/response details
+NAUKRI_LOG_BODY = False              # Include response body in logs on error
 
 # Proxy Configuration
 PROXY_ENABLED = False  # Set to False for PythonAnywhere/Replit

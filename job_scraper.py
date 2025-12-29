@@ -249,6 +249,10 @@ CONFIG = {
         'max_pages_per_search': 5,
         'results_per_page': 50,
         'max_retries': 3,
+        'retry_backoff': 2,
+        'timeout': 15,
+        'log_level': 'DEBUG',
+        'log_body': False,
     },
     
     # =========================================================================
@@ -448,8 +452,14 @@ try:
         CONFIG['naukri']['session_enabled'] = config.NAUKRI_SESSION_ENABLED
     if hasattr(config, 'NAUKRI_RETRY_ATTEMPTS'):
         CONFIG['naukri']['max_retries'] = config.NAUKRI_RETRY_ATTEMPTS
+    if hasattr(config, 'NAUKRI_RETRY_BACKOFF'):
+        CONFIG['naukri']['retry_backoff'] = config.NAUKRI_RETRY_BACKOFF
     if hasattr(config, 'NAUKRI_MAX_TIMEOUT'):
         CONFIG['naukri']['timeout'] = config.NAUKRI_MAX_TIMEOUT
+    if hasattr(config, 'NAUKRI_LOG_LEVEL'):
+        CONFIG['naukri']['log_level'] = config.NAUKRI_LOG_LEVEL
+    if hasattr(config, 'NAUKRI_LOG_BODY'):
+        CONFIG['naukri']['log_body'] = config.NAUKRI_LOG_BODY
     
     # Override Superset settings
     if hasattr(config, 'SUPERSET_ENABLED'):
@@ -2370,7 +2380,58 @@ class NaukriScraper(BaseScraper):
         }
         
         return headers
-    
+
+    def _log_request_details(self, url: str, method: str, params: dict, headers: dict):
+        """Log detailed request information for debugging"""
+        if CONFIG['naukri'].get('log_level', 'DEBUG') != 'DEBUG':
+            return
+            
+        # Mask sensitive data in headers if any
+        safe_headers = {k: v for k, v in headers.items() if k.lower() not in ['authorization', 'cookie']}
+        
+        self.logger.debug(f"   [REQUEST] {method} {url}")
+        self.logger.debug(f"   [PARAMS] {params}")
+        self.logger.debug(f"   [HEADERS] {safe_headers}")
+
+    def _log_response_details(self, response: requests.Response, start_time: float):
+        """Log detailed response information for debugging"""
+        duration = time.time() - start_time
+        log_level = CONFIG['naukri'].get('log_level', 'DEBUG')
+        
+        if response.ok:
+            self.logger.debug(f"   [RESPONSE] Status: {response.status_code} {response.reason} | Time: {duration:.2f}s")
+        else:
+            self.logger.warning(f"   [RESPONSE] Status: {response.status_code} {response.reason} | Time: {duration:.2f}s")
+        
+        if log_level == 'DEBUG':
+            # Log interesting headers
+            rate_limit_headers = {k: v for k, v in response.headers.items() 
+                                  if any(x in k.lower() for x in ['rate-limit', 'retry-after', 'x-naukri', 'cloudflare', 'server'])}
+            if rate_limit_headers:
+                self.logger.debug(f"   [HEADERS] {rate_limit_headers}")
+                
+            if not response.ok or CONFIG['naukri'].get('log_body', False):
+                # Log preview of response body on error
+                try:
+                    preview = response.text[:500]
+                    self.logger.debug(f"   [BODY PREVIEW] {preview}")
+                except Exception as e:
+                    self.logger.debug(f"   [BODY PREVIEW ERROR] Could not read body: {e}")
+
+    @staticmethod
+    def _before_retry_log(retry_state):
+        """Log before each retry attempt"""
+        self = retry_state.args[0]
+        attempt = retry_state.attempt_number
+        
+        if retry_state.outcome.failed:
+            exc = retry_state.outcome.exception()
+            self.logger.warning(f"   ⚠️ Attempt {attempt} failed: {type(exc).__name__}: {str(exc)[:100]}")
+        
+        if hasattr(retry_state, 'next_action') and retry_state.next_action:
+            wait_time = retry_state.next_action.sleep
+            self.logger.info(f"   🔄 Retry {attempt} scheduled in {wait_time:.1f}s...")
+
     def _smart_delay(self, min_delay: float = 5.0, max_delay: float = 10.0):
         """Randomized delay to simulate human browsing"""
         delay = random.uniform(min_delay, max_delay)
@@ -2384,41 +2445,74 @@ class NaukriScraper(BaseScraper):
         time.sleep(delay)
     
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=30),
-        retry=retry_if_exception_type((requests.RequestException, ConnectionError))
+        stop=stop_after_attempt(CONFIG['naukri'].get('max_retries', 3)),
+        wait=wait_exponential(multiplier=CONFIG['naukri'].get('retry_backoff', 2), min=2, max=30),
+        retry=retry_if_exception_type((requests.RequestException, ConnectionError, requests.HTTPError)),
+        before_sleep=_before_retry_log
     )
     def _make_api_request_with_retry(self, url: str, params: dict, headers: dict) -> requests.Response:
-        """Make API request with automatic exponential backoff"""
+        """Make API request with automatic exponential backoff and detailed logging"""
         # Use session if available, otherwise use requests
         http_client = self.session if self.session else requests
+        start_time = time.time()
         
-        response = http_client.get(url, params=params, headers=headers, timeout=15)
+        # Log request details
+        self._log_request_details(url, "GET", params, headers)
         
-        # Handle specific error codes
-        if response.status_code == 406:
-            # 406: Not Acceptable - Rotate UA and retry
-            self.logger.warning(f"   ⚠️ 406 detected, rotating User-Agent and retrying...")
-            headers['User-Agent'] = self._get_random_user_agent()
-            raise requests.RequestException("406 detected, retrying with new UA")
-        elif response.status_code == 429:
-            # 429: Too Many Requests - Wait longer
-            self.logger.warning(f"   ⚠️ 429 Rate limit detected, waiting 30s...")
-            time.sleep(30)
-            raise requests.RequestException("429 rate limit, retrying after delay")
-        elif response.status_code >= 500:
-            # 500+: Server error - Will be handled by @retry decorator
-            self.logger.warning(f"   ⚠️ Server error {response.status_code}, retrying with backoff...")
-            raise requests.RequestException(f"Server error {response.status_code}")
-        
-        response.raise_for_status()
-        return response
+        try:
+            response = http_client.get(
+                url, 
+                params=params, 
+                headers=headers, 
+                timeout=CONFIG['naukri'].get('timeout', 15)
+            )
+            
+            # Log response details
+            self._log_response_details(response, start_time)
+            
+            # Handle specific error codes
+            if response.status_code == 406:
+                # 406: Not Acceptable - Rotate UA and retry
+                self.logger.warning(f"   ⚠️ 406 Not Acceptable detected, rotating User-Agent...")
+                headers['User-Agent'] = self._get_random_user_agent()
+                raise requests.HTTPError(f"406 Not Acceptable: {response.reason}", response=response)
+            
+            elif response.status_code == 429:
+                # 429: Too Many Requests - Wait longer
+                self.logger.warning(f"   ⚠️ 429 Rate limit detected, waiting 30s...")
+                time.sleep(30)
+                raise requests.HTTPError(f"429 Too Many Requests: {response.reason}", response=response)
+            
+            elif response.status_code >= 500:
+                # 500+: Server error - Will be handled by @retry decorator
+                self.logger.warning(f"   ⚠️ Server error {response.status_code} {response.reason}")
+                raise requests.HTTPError(f"{response.status_code} Server Error: {response.reason}", response=response)
+            
+            response.raise_for_status()
+            return response
+            
+        except requests.exceptions.Timeout as e:
+            self.logger.error(f"   ⏱️ Request timeout occurred: {type(e).__name__}")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(f"   🌐 Connection error occurred: {type(e).__name__}")
+            raise
+        except requests.exceptions.HTTPError:
+            # Already logged above
+            raise
+        except requests.RequestException as e:
+            self.logger.error(f"   ❌ Request failed: {type(e).__name__}: {e}")
+            raise
     
     def _scrape_via_api(self, keyword: str, location: str) -> List[Job]:
         """Scrape using mobile API with professional-grade reliability"""
         jobs = []
+        max_pages = CONFIG['naukri'].get('max_pages_per_search', 5)
         
-        for page in range(1, CONFIG['naukri']['max_pages_per_search'] + 1):
+        self.logger.info(f"   🔍 Starting API scrape for '{keyword}' in '{location}' (Up to {max_pages} pages)")
+        
+        for page in range(1, max_pages + 1):
+            page_start_time = time.time()
             try:
                 params = {
                     'noOfResults': CONFIG['naukri']['results_per_page'],
@@ -2433,35 +2527,38 @@ class NaukriScraper(BaseScraper):
                 
                 # Get fresh headers with rotated UA
                 headers = self._get_api_headers()
-                self.logger.debug(f"   Using UA: {headers['User-Agent'][:50]}...")
                 
                 # Make request with retry logic
+                self.logger.info(f"   📄 Scraping page {page}/{max_pages}...")
                 response = self._make_api_request_with_retry(self.API_URL, params, headers)
-                
-                self.logger.debug(f"   Status: {response.status_code}")
                 
                 data = response.json()
                 job_list = data.get('jobDetails', [])
                 
                 if not job_list:
-                    self.logger.debug(f"   No more jobs found on page {page}")
+                    self.logger.info(f"   ⏹️ No more jobs found on page {page}")
                     break
                 
+                page_jobs_count = 0
                 for job_data in job_list:
                     try:
                         job = self._parse_api_response(job_data, keyword)
                         if job and self.validate_job(job) and self.apply_filters(job):
                             jobs.append(job)
+                            page_jobs_count += 1
                     except Exception as e:
                         self.logger.debug(f"Failed to parse API response: {e}")
                 
+                duration = time.time() - page_start_time
+                self.logger.info(f"   ✅ Page {page} processed: Found {len(job_list)} jobs, {page_jobs_count} matched filters ({duration:.1f}s)")
+                
                 # Smart delay between pages
-                if page < CONFIG['naukri']['max_pages_per_search']:
+                if page < max_pages:
                     self._smart_delay(min_delay=CONFIG['scraping']['delay_min'], 
                                     max_delay=CONFIG['scraping']['delay_max'])
                 
             except Exception as e:
-                self.logger.error(f"   ❌ Naukri API request failed after retries: {e}")
+                self.logger.error(f"   ❌ Naukri API request failed on page {page} after retries: {type(e).__name__}: {e}")
                 self.stats['errors'] += 1
                 # Don't break, try next page
                 continue
