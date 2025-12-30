@@ -406,6 +406,8 @@ CONFIG = {
         'require_title_keywords': [],         # Job must contain one of these
         'min_salary': None,                   # Minimum salary (if parseable)
         'max_experience_years': 2,            # Skip jobs requiring more exp
+        'fresher_only_mode': False,           # Strict fresher-only filtering
+        'india_only_mode': False,             # India-only location filtering
     },
 }
 
@@ -492,6 +494,10 @@ try:
         CONFIG['filters']['exclude_companies'] = config.EXCLUDE_COMPANIES
     if hasattr(config, 'MAX_EXPERIENCE_YEARS'):
         CONFIG['filters']['max_experience_years'] = config.MAX_EXPERIENCE_YEARS
+    if hasattr(config, 'FRESHER_ONLY_MODE'):
+        CONFIG['filters']['fresher_only_mode'] = config.FRESHER_ONLY_MODE
+    if hasattr(config, 'INDIA_ONLY_MODE'):
+        CONFIG['filters']['india_only_mode'] = config.INDIA_ONLY_MODE
     
     # Override Scraping behavior
     if hasattr(config, 'SCRAPING_DELAY_MIN'):
@@ -546,6 +552,8 @@ try:
     print(f"   Indeed keywords: {len(CONFIG['indeed']['keywords'])}")
     print(f"   Naukri keywords: {len(CONFIG['naukri']['keywords'])}")
     print(f"   Proxy enabled: {CONFIG['proxy']['enabled']}")
+    print(f"   🎯 FRESHER ONLY MODE: {CONFIG['filters']['fresher_only_mode']}")
+    print(f"   🇮🇳 INDIA ONLY MODE: {CONFIG['filters']['india_only_mode']}")
     
 except ImportError:
     print("⚠️ config.py not found, using default CONFIG values from job_scraper.py")
@@ -646,8 +654,10 @@ class Job:
             f"📍 {self._escape_md(self.location or 'Not specified')}",
         ]
         
-        if self.experience:
-            lines.append(f"📊 Exp: {self._escape_md(self.experience)}")
+        # Always show experience requirement prominently
+        experience_text = self.experience if self.experience else 'Fresher \\/ 0\\-2 Years'
+        lines.append(f"⭐ *Experience*: {self._escape_md(experience_text)}")
+        
         if self.salary:
             lines.append(f"💰 {self._escape_md(self.salary)}")
         if self.job_type:
@@ -662,7 +672,7 @@ class Job:
             "",
             f"🔗 [Apply Now]({self.url})",
             "",
-            f"\\#{self.source} \\#jobs \\#fresher",
+            f"\\#{self.source} \\#jobs \\#fresher \\#india",
         ])
         
         return '\n'.join(lines)
@@ -1865,6 +1875,80 @@ class BaseScraper(ABC):
             if any(kw.lower() in title_lower for kw in filters['exclude_title_keywords']):
                 self.logger.debug(f"Filtered out (title): {job.title}")
                 return False
+        
+        # FRESHER ONLY MODE - Strict filtering for entry-level/fresher jobs only
+        if filters.get('fresher_only_mode', False):
+            title_lower = job.title.lower()
+            experience_lower = (job.experience or '').lower()
+            
+            # Check if experience explicitly mentions > 2 years
+            if job.experience:
+                # Look for patterns like "3+ years", "4-5 years", "5 years", etc.
+                exp_patterns = [
+                    r'(\d+)\s*[-+]\s*(\d+)?\s*ye?a?r?s?',  # Matches "3-5 years", "3+ years", "3 years"
+                    r'(\d+)\s*ye?a?r?s?\s*[-+]',  # Matches "3 years+"
+                ]
+                for pattern in exp_patterns:
+                    matches = re.findall(pattern, experience_lower)
+                    for match in matches:
+                        # Get the first number in the match
+                        try:
+                            years = int(match[0]) if match[0] else 0
+                            if years > 2:
+                                self.logger.debug(f"Filtered out (experience > 2 years): {job.title} - {job.experience}")
+                                return False
+                        except (ValueError, IndexError):
+                            pass
+            
+            # Additional title-based filtering for fresher mode
+            non_fresher_indicators = [
+                'experienced', 'expert', 'professional', 'specialist',
+                '3 years', '4 years', '5 years', '6 years', '7 years',
+                '3+ yrs', '4+ yrs', '5+ yrs',
+            ]
+            if any(indicator in title_lower for indicator in non_fresher_indicators):
+                self.logger.debug(f"Filtered out (non-fresher indicator): {job.title}")
+                return False
+        
+        # INDIA ONLY MODE - Filter out non-India locations
+        if filters.get('india_only_mode', False):
+            if job.location:
+                location_lower = job.location.lower()
+                
+                # List of Indian cities, states, and keywords
+                india_keywords = [
+                    'india', 'delhi', 'mumbai', 'bangalore', 'bengaluru', 'hyderabad', 
+                    'pune', 'chennai', 'kolkata', 'ahmedabad', 'surat', 'jaipur',
+                    'lucknow', 'kanpur', 'nagpur', 'indore', 'thane', 'bhopal',
+                    'visakhapatnam', 'pimpri', 'patna', 'vadodara', 'ghaziabad',
+                    'ludhiana', 'agra', 'nashik', 'faridabad', 'meerut', 'rajkot',
+                    'varanasi', 'srinagar', 'aurangabad', 'dhanbad', 'amritsar',
+                    'navi mumbai', 'allahabad', 'ranchi', 'howrah', 'coimbatore',
+                    'jabalpur', 'gwalior', 'vijayawada', 'jodhpur', 'madurai',
+                    'raipur', 'kota', 'chandigarh', 'gurgaon', 'gurugram', 'noida',
+                    'kochi', 'thiruvananthapuram', 'mysore', 'bhubaneswar',
+                    'remote india', 'work from home india', 'wfh india',
+                    # States
+                    'maharashtra', 'karnataka', 'tamil nadu', 'telangana', 'kerala',
+                    'gujarat', 'rajasthan', 'uttar pradesh', 'west bengal', 'haryana',
+                    'madhya pradesh', 'punjab', 'odisha', 'andhra pradesh',
+                ]
+                
+                # Check if any India keyword is in the location
+                is_india_location = any(keyword in location_lower for keyword in india_keywords)
+                
+                # Also check for explicit non-India locations to exclude
+                non_india_keywords = [
+                    'usa', 'united states', 'uk', 'united kingdom', 'canada',
+                    'australia', 'singapore', 'dubai', 'uae', 'germany', 'france',
+                    'netherlands', 'switzerland', 'new york', 'london', 'toronto',
+                    'sydney', 'melbourne', 'europe', 'asia pacific', 'apac',
+                ]
+                has_non_india = any(keyword in location_lower for keyword in non_india_keywords)
+                
+                if has_non_india or not is_india_location:
+                    self.logger.debug(f"Filtered out (non-India location): {job.location}")
+                    return False
         
         return True
     

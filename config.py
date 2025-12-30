@@ -1,5 +1,12 @@
 # Configuration file for Multi-Platform Job Scraper
 # Update these settings before running the scraper
+#
+# 🎯 NEW FEATURES:
+# - FRESHER_ONLY_MODE: Enables strict filtering for fresher/entry-level jobs (0-2 years exp)
+# - INDIA_ONLY_MODE: Filters out all non-India location jobs
+# - Experience requirement is now ALWAYS shown in Telegram messages
+#
+# These settings ensure you only get India-focused fresher jobs in your channel!
 
 # Telegram Configuration
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
@@ -128,6 +135,11 @@ EXCLUDE_COMPANIES = [
 ]
 
 MAX_EXPERIENCE_YEARS = 2  # Maximum years of experience for "fresher" jobs
+
+# --- FRESHER ONLY MODE (India-focused) ---
+# When enabled, applies stricter filtering for fresher/entry-level jobs only
+FRESHER_ONLY_MODE = True  # Set to True to enable strict fresher-only filtering
+INDIA_ONLY_MODE = True     # Set to True to filter out non-India locations
 
 # LinkedIn Configuration
 LINKEDIN_ENABLED = True

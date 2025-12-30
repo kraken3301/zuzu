@@ -6,6 +6,9 @@ A production-grade job scraping bot that targets LinkedIn, Indeed, Naukri, and S
 
 - **Multi-Platform Scraping**: LinkedIn, Indeed, Naukri, and Superset
 - **Telegram Integration**: Automatic posting of new jobs to Telegram channels
+- **🎯 Fresher-Only Mode**: Strict filtering for entry-level/fresher jobs (0-2 years experience)
+- **🇮🇳 India-Only Mode**: Filter out all non-India location jobs
+- **Experience Display**: Experience requirements are ALWAYS shown in Telegram messages
 - **Google Drive Persistence**: All data stored on Google Drive for persistence
 - **Anti-Detection Measures**: Proxy rotation, browser fingerprinting, and human-like behavior
 - **Comprehensive Filtering**: Filter jobs by experience, keywords, companies, and more
@@ -21,13 +24,33 @@ pip install -r requirements.txt
 
 ### 2. Update Configuration
 
-Edit the `CONFIG` dictionary in `job_scraper.py`:
+**Recommended**: Edit `config.py` for easy configuration:
+
+```python
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
+TELEGRAM_CHANNEL_ID = "@your_channel"       # Channel username or chat ID
+
+# 🎯 NEW: Fresher & India-Only Modes
+FRESHER_ONLY_MODE = True  # Enable strict fresher-only filtering (0-2 years)
+INDIA_ONLY_MODE = True     # Filter out non-India locations
+
+# Configure keywords and locations
+LINKEDIN_KEYWORDS = ['software engineer fresher', 'python developer', ...]
+LINKEDIN_LOCATIONS = ['India', 'Bangalore', 'Mumbai', ...]
+```
+
+Alternatively, edit the `CONFIG` dictionary in `job_scraper.py`:
 
 ```python
 CONFIG = {
     'telegram': {
         'bot_token': 'YOUR_BOT_TOKEN_HERE',  # Get from @BotFather
         'channel_id': '@your_channel',        # Channel username or chat ID
+    },
+    'filters': {
+        'fresher_only_mode': True,  # NEW: Strict fresher filtering
+        'india_only_mode': True,     # NEW: India-only filtering
     },
     # ... other settings
 }
@@ -130,6 +153,45 @@ Each platform (LinkedIn, Indeed, Naukri, Superset) has its own configuration:
 - `use_free_proxies`: Use free proxy sources
 - `custom_proxies`: Add your own paid proxies
 - `rotate_per_request`: Rotate proxy for each request
+
+### 🎯 Fresher & India Filtering (NEW)
+
+#### FRESHER_ONLY_MODE
+When enabled, applies strict filtering to ensure only fresher/entry-level jobs are returned:
+- Filters out jobs requiring 3+ years of experience
+- Excludes titles with "experienced", "expert", "professional", "specialist"
+- Blocks jobs with experience patterns like "3+ years", "4-5 years", etc.
+
+#### INDIA_ONLY_MODE
+When enabled, filters out all non-India location jobs:
+- Only includes jobs from Indian cities and states
+- Supports all major metros: Delhi, Mumbai, Bangalore, Hyderabad, Pune, Chennai, Kolkata, etc.
+- Supports Tier-2 cities: Chandigarh, Jaipur, Kochi, Coimbatore, Lucknow, Indore, etc.
+- Excludes international locations: USA, UK, Canada, Singapore, Dubai, etc.
+- Includes "Remote India" and "Work from Home India" jobs
+
+**Example Configuration:**
+```python
+# In config.py
+FRESHER_ONLY_MODE = True   # Only show fresher/entry-level jobs (0-2 years)
+INDIA_ONLY_MODE = True      # Only show jobs in India
+MAX_EXPERIENCE_YEARS = 2    # Maximum experience threshold
+```
+
+**Telegram Message Enhancement:**
+All Telegram job alerts now display experience requirements prominently:
+```
+🚨 NEW JOB ALERT 🔗
+
+💼 Software Engineer - Fresher
+🏢 TCS
+📍 Bangalore, Karnataka
+⭐ Experience: Fresher / 0-2 Years  ← ALWAYS SHOWN
+💰 ₹3-5 LPA
+
+🔗 Apply Now
+#linkedin #jobs #fresher #india
+```
 
 ## Google Colab Setup
 
